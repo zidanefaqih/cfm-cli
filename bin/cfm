@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""
+cfm - Camoufox Manager (interactive, arrow-key menus)
+
+    $ cfm
+    cfm> /new          -> wizard: nama → OS → proxy  (pakai panah)
+    cfm> /list
+    cfm> /run acc1     -> kalau tanpa port, muncul pilihan panah
+"""
+import argparse, json, os as _os, pathlib, re, shutil, socket, subprocess, sys, random
+
+# Samakan dgn cfox: install Camoufox di luar ~/.cache (biar gak kehapus 'rm -rf ~/.cache/*')
+if not _os.environ.get("XDG_CACHE_HOME"):
+    _os.environ["XDG_CACHE_HOME"] = str(pathlib.Path(os.environ.get("CAMOUFOX_INSTALL_DIR", pathlib.Path.home()/".local"/"share"/"camoufox")))
+
+if not _os.environ.get("DISPLAY"):
+    try:
+        xs = sorted(pathlib.Path("/tmp/.X11-unix").iterdir())
+        if xs: _os.environ["DISPLAY"] = ":" + xs[-1].name.lstrip("X")
+    except Exception:
+        pass
+
+ROOT    = pathlib.Path.home() / "camfox-profiles"
+CONFDIR = pathlib.Path.home() / "surfshark-proxy" / "configs"
+VENV    = pathlib.Path.home() / ".camoufox-venv"
+CFOX    = pathlib.Path.home() / ".local/bin/cfox"
+HOTSPOT = 1080
+
+class C:
+    R="\033[0m"; B="\033[1m"; D="\033[90m"
+    G="\033[32m"; Y="\033[33m"; RE="\033[31m"; CY="\033[36m"; M="\033[35m"
+def c(t, col): return f"{col}{t}{C.R}"
+
+# ---------------- proxy ----------------
+def port_open(p):
+    try:
+        with socket.create_connection(("127.0.0.1", int(p)), timeout=0.4): return True
+    except Exception: return False
+
+def discover_proxies():
+    out = {}
+    # hotspot SELALU dimasukkan (walau mati), biar bisa dipilih dari menu
+    out["hotspot"] = {"port": HOTSPOT, "desc": "iPhone hotspot (Telkomsel)",
+                      "alive": port_open(HOTSPOT)}
+    if CONFDIR.exists():
+        for f in sorted(CONFDIR.glob("*.conf")):
+            t = f.read_text()
+            m = re.search(r"BindAddress\s*=\s*127\.0\.0\.1:(\d+)", t)
+            if not m: continue
+            ep = re.search(r"Endpoint\s*=\s*([^\s:]+)", t)
+            out[f.stem] = {"port": int(m.group(1)), "desc": (ep.group(1) if ep else "?")}
+    return out
+
+def proxy_choices(include_none=True):
+    """Buat daftar pilihan proxy buat menu panah."""
+    items = []
+    px = discover_proxies()
+    for k, v in px.items():
+        alive = v.get("alive", port_open(v["port"]))
+        mark = "✓" if alive else "✗"
+        items.append((f"{mark} {v['port']:>5}  {k:<18} {v['desc'][:34]}", v["port"]))
+    if include_none:
+        items.append(("—  tanpa proxy (pakai IP asli!)", "__none__"))
+    return items
+
+def proxy_ip(port, timeout=9):
+    try:
+        r = subprocess.run(["curl","-s","-m",str(timeout),"--socks5-hostname",f"127.0.0.1:{port}",
+                            "http://ip-api.com/json/?fields=query,country,city,isp,hosting"],
+                           capture_output=True, text=True, timeout=timeout+5)
+        return json.loads(r.stdout) if r.stdout.strip() else None
+    except Exception: return None
+
+# ---------------- profil ----------------
+def load(pdir):
+    f = pdir / "fingerprint.json"
+    return json.loads(f.read_text()) if f.exists() else None
+def save(pdir, m): (pdir / "fingerprint.json").write_text(json.dumps(m, indent=1))
+def profiles():
+    if not ROOT.exists(): return []
+    out=[]
+    for d in sorted(ROOT.iterdir()):
+        if d.is_dir() and not d.name.startswith("_"):
+            m = load(d)
+            if m: out.append((d.name, m))
+    return out
+def label_for(port, px=None):
+    px = px or discover_proxies()
+    return next((k for k,v in px.items() if v["port"]==port), "?")
+
+# ---------------- tampilan ----------------
+def show_list():
+    rows = profiles()
+    if not rows: print(c("  belum ada profil. ketik: /new", C.Y)); return
+    px = discover_proxies()
+    print()
+    print(c(f"  {'PROFIL':<10}{'OS':<9}{'PRESET':<13}{'CORES':<7}{'SCREEN':<12}{'PROXY':<26}STATUS", C.B))
+    print(c("  " + "-"*92, C.D))
+    for name, m in rows:
+        p=m["preset"]; n=p.get("navigator",{}); s=p.get("screen",{})
+        port=m.get("proxy_port")
+        if port == "__none__":
+            ptxt = c("TANPA PROXY", C.Y) + " (IP asli)"
+            stat = ""
+        elif port:
+            ptxt = f"{port} ({label_for(port,px)})"
+            stat = c("aktif",C.G) if port_open(port) else c("PROXY MATI",C.RE)
+        else:
+            ptxt = c("-- belum di-set --", C.D); stat = ""
+        print(f"  {c(name,C.CY):<19}{m['os']:<9}{m['preset_id']:<13}"
+              f"{str(n.get('hardwareConcurrency')):<7}"
+              f"{str(s.get('width'))+'x'+str(s.get('height')):<12}{ptxt:<26}{stat}")
+    print(c(f"\n  total {len(rows)} profil", C.D))
+
+def show_proxies(test=False):
+    px = discover_proxies()
+    print()
+    print(c(f"  {'LABEL':<20}{'PORT':<8}{'STATUS':<11}", C.B) + c("DESKRIPSI", C.B))
+    print(c("  " + "-"*74, C.D))
+    for k,v in px.items():
+        alive = port_open(v["port"])
+        print(f"  {k:<20}{v['port']:<8}"
+              f"{(c('hidup',C.G) if alive else c('MATI',C.RE)):<20}{c(v['desc'],C.D)}")
+    if test:
+        print(c("\n  tes IP keluar...", C.D))
+        for k,v in px.items():
+            d = proxy_ip(v["port"])
+            if d:
+                flag = c(" [DC]",C.Y) if d.get("hosting") else ""
+                print(f"    {k:<20} {c(d.get('query','?')):<27}{d.get('country')}/{d.get('city')}{flag}")
+            else: print(f"    {k:<20} {c('gagal',C.RE)}")
+    print()
+
+def show_help():
+    print(f"""
+{c('  Camoufox Manager',C.B)} {c('- perintah (semua bisa juga lewat menu panah)',C.D)}
+
+  {c('/new',C.CY)} [nama]        wizard: nama → OS → proxy (panah)
+  {c('/list',C.CY)}              daftar profil + proxy
+  {c('/proxies',C.CY)} [--test]  daftar proxy, --test cek IP keluar
+  {c('/run',C.CY)} [nama]        jalankan (pilih profil+proxy lewat panah kalau kosong)
+  {c('/proxy',C.CY)} [nama]      set proxy default profil (panah)
+  {c('/info',C.CY)} <nama>       detail UA/GPU/screen/fonts
+  {c('/newfp',C.CY)} <nama>      regenerate fingerprint (profil & proxy tetap)
+  {c('/newname',C.CY)} <l> <b>   ganti nama profil
+  {c('/rm',C.CY)} [nama]         hapus profil
+  {c('/help',C.CY)}   {c('/quit',C.CY)}        bantuan / keluar
+
+  {c('tab',C.D)}=autocomplete  {c('↑ ↓',C.D)}=riwayat  {c('← →',C.D)}=menu
+""")
+
+# ---------------- aksi ----------------
+def _ask(q):
+    """Wrapper questionary — aman kalau bukan TTY."""
+    import questionary
+    if not sys.stdin.isatty():
+        return None
+    return q.ask()
+
+def act_new(args):
+    import questionary
+    # 1. nama
+    if args and not args[0].startswith("-"):
+        name = args[0]
+        rest = args[1:]
+    else:
+        name = _ask(questionary.text("Nama profil:"))
+        if not name: print(c("  dibatalkan", C.Y)); return
+        name = name.strip()
+        rest = args
+    if (ROOT/name/"fingerprint.json").exists():
+        print(c(f"  profil '{name}' sudah ada", C.Y)); return
+
+    # 2. OS
+    os_name = None
+    if "--os" in rest:
+        i = rest.index("--os")
+        if i+1 < len(rest): os_name = rest[i+1]
+    if not os_name:
+        os_name = _ask(questionary.select(
+            "Pilih OS (fingerprint-nya ikut):",
+            choices=[questionary.Choice("Windows 10/11  (paling umum)", "windows"),
+                     questionary.Choice("macOS          (Apple M1/Intel)", "macos"),
+                     questionary.Choice("Linux          (paling jarang)", "linux")]))
+        if not os_name: print(c("  dibatalkan", C.Y)); return
+
+    # 3. proxy
+    port = None
+    if "--port" in rest:
+        i = rest.index("--port")
+        if i+1 < len(rest) and rest[i+1].isdigit(): port = int(rest[i+1])
+    if port is None and "--noproxy" not in rest:
+        items = proxy_choices()
+        labels = [x[0] for x in items]
+        sel = _ask(questionary.select(
+            "Pilih proxy:", choices=[questionary.Choice(l, v) for l, v in items]))
+        if sel is None:
+            print(c("  dibatalkan", C.Y)); return
+        port = None if sel == "__none__" else sel
+
+    # 4. bikin
+    pdir = ROOT/name; pdir.mkdir(parents=True, exist_ok=True)
+    from camoufox.fingerprints import load_presets
+    pres = load_presets().get("presets", {})
+    vf = ROOT/"_valid.json"
+    valid = json.loads(vf.read_text()) if vf.exists() else None
+    pool = pres[os_name]
+    good = (valid or {}).get(os_name) or list(range(len(pool)))
+    used = {m.get("preset_id") for _,m in profiles()}
+    avail = [i for i in good if f"{os_name}:{i}" not in used] or good
+    i = random.choice(avail)
+    FONTS = json.load(open(VENV/"lib/python3.12/site-packages/camoufox/fonts.json"))
+    omap = {"windows":"win","macos":"mac","linux":"lin"}
+    rng = random.Random(f"{os_name}:{i}")
+    fl = FONTS[omap[os_name]]
+    n = rng.randint(180,320) if omap[os_name]=="mac" else rng.randint(55,85)
+    preset = dict(pool[i]); preset["fonts"] = sorted(rng.sample(fl, min(n,len(fl))))
+    meta = {"profile":name, "os":os_name, "preset_id":f"{os_name}:{i}", "preset":preset,
+            "proxy_port": "__none__" if port is None else int(port)}
+    save(pdir, meta)
+
+    nv = preset.get("navigator",{}); sc = preset.get("screen",{}); wg = preset.get("webgl",{})
+    print(c(f"\n  ✓ profil '{name}' dibuat", C.G))
+    print(f"    os       : {os_name}  ({os_name}:{i})")
+    print(f"    cores    : {nv.get('hardwareConcurrency')}   screen: {sc.get('width')}x{sc.get('height')}")
+    print(f"    GPU      : {str(wg.get('unmaskedRenderer'))[:60]}")
+    print(f"    fonts    : {len(preset['fonts'])}")
+    print(f"    proxy    : {port or 'TANPA PROXY (IP asli!)'}")
+    if port: print(c(f"\n  jalankan: /run {name}", C.D))
+
+
+def act_proxy(args):
+    import questionary
+    name = args[0] if args else _ask(questionary.select(
+        "Pilih profil:", choices=[n for n,_ in profiles()]))
+    if not name: print(c("  dibatalkan",C.Y)); return
+    m = load(ROOT/name)
+    if not m: print(c(f"  profil '{name}' tidak ada", C.RE)); return
+    if len(args) > 1 and str(args[1]).lower() in ("none","noproxy","off","-"):
+        m["proxy_port"] = "__none__"; save(ROOT/name, m)
+        print(c(f"  ✓ {name} → default: TANPA PROXY (IP asli)",C.Y)); return
+    if len(args) > 1 and str(args[1]).isdigit():
+        port = int(args[1])
+    else:
+        items = proxy_choices()
+        port = _ask(questionary.select(f"Proxy untuk {name}:",
+                    choices=[questionary.Choice(l, v) for l,v in items]))
+    if port == "__none__" or port is None:
+        if port is None:
+            print(c("  dibatalkan",C.Y)); return
+    if port == "__none__":
+        m["proxy_port"] = "__none__"; save(ROOT/name, m)
+        print(c(f"  ✓ {name} → default: TANPA PROXY (IP asli)",C.Y)); return
+    m["proxy_port"] = int(port); save(ROOT/name, m)
+    print(c(f"  ✓ {name} → {port}",C.G) +
+          ("" if port_open(port) else c("  [port MATI]", C.RE)) +
+          c(f"  ({label_for(int(port))})", C.D))
+
+
+def act_run(args):
+    """Jalankan profil. Tanpa argumen port -> SELALU tanya, dengan opsi 'default'."""
+    import questionary
+    # --- pilih profil ---
+    if args and not args[0].startswith("-"):
+        name, rest = args[0], args[1:]
+    else:
+        rows = profiles()
+        if not rows: print(c("  belum ada profil",C.Y)); return
+        sel = _ask(questionary.select("Pilih profil:",
+            choices=[f"{n}  ({m['os']} {m['preset_id']} → {_ptext(m.get('proxy_port'))})"
+                     for n,m in rows]))
+        if sel is None: print(c("  dibatalkan",C.Y)); return
+        name = sel.split()[0]; rest = args
+    m = load(ROOT/name)
+    if not m: print(c(f"  profil '{name}' tidak ada", C.RE)); return
+
+    bg = "--bg" in rest
+    # --- jalur cepat (non-interaktif) ---
+    digits = [a for a in rest if str(a).isdigit()]
+    forced_none = any(str(a).lower() in ("none","noproxy","off") for a in rest)
+    if forced_none:
+        m["proxy_port"] = "__none__"; save(ROOT/name, m)
+        return _launch(name, m, None, bg)
+    if digits:
+        port = int(digits[0])
+        m["proxy_port"] = port; save(ROOT/name, m)
+        return _launch(name, m, port, bg)
+
+    # --- interaktif: SELALU tanya, dengan 'default' di paling atas ---
+    saved = m.get("proxy_port")
+    items = []
+    if saved is not None:
+        items.append((f"★ pakai DEFAULT profil ini  →  {_ptext(saved, full=True)}", "DEFAULT"))
+    for lab, val in proxy_choices(include_none=True):
+        items.append((lab, val))
+    # kalau bukan TTY (script/pipa): langsung pakai default, tanpa menu
+    if not sys.stdin.isatty():
+        port = None if (saved is None or saved == "__none__") else saved
+        print(c(f"  (non-interaktif: pakai {_ptext(saved, full=True)})", C.D))
+        return _launch(name, m, port, bg)
+
+    sel = _ask(questionary.select(f"Proxy untuk {name}:",
+                choices=[questionary.Choice(l, v) for l,v in items]))
+    if sel is None: print(c("  dibatalkan",C.Y)); return
+
+    if sel == "DEFAULT":
+        port = None if saved == "__none__" else saved
+    elif sel == "__none__":
+        port = None
+        m["proxy_port"] = "__none__"; save(ROOT/name, m)
+    else:
+        port = sel
+        m["proxy_port"] = int(port); save(ROOT/name, m)
+    return _launch(name, m, port, bg)
+
+
+def _ptext(v, full=False):
+    """Teks status proxy utk ditampilkan."""
+    if v == "__none__": return c("TANPA PROXY", C.Y) + (c(" (IP asli)", C.RE) if full else "")
+    if v: return str(v)
+    return "belum di-set"
+
+
+def _launch(name, m, port, bg):
+    """Jalankan cfox dengan/ tanpa proxy."""
+    nv=m["preset"].get("navigator",{}); sc=m["preset"].get("screen",{})
+    dim=f"{sc.get('width')}x{sc.get('height')}  {nv.get('hardwareConcurrency')}c"
+    if port is None:
+        print(c(f"  ▶ {name}", C.Y) + f"  {m['os']} {m['preset_id']}  {dim}  → "
+              + c("TANPA PROXY (IP asli!)", C.RE))
+        cmd = [sys.executable, str(CFOX), name]
+    else:
+        if not port_open(port):
+            print(c(f"  port {port} MATI — jalankan: ss-up", C.RE)); return
+        print(c(f"  ▶ {name}", C.G) + f"  {m['os']} {m['preset_id']}  {dim}  "
+              f"→ {port} ({label_for(int(port))})")
+        cmd = [sys.executable, str(CFOX), name, "--port", str(port)]
+    if bg:
+        subprocess.Popen(["setsid","bash","-c",f"{' '.join(cmd)} >> /tmp/cfm-{name}.log 2>&1"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        print(c(f"    background — log: /tmp/cfm-{name}.log", C.D))
+    else:
+        subprocess.run(cmd)
+
+
+def act_newfp(args):
+    """Regenerate fingerprint, profil + proxy tetap."""
+    import questionary
+    name = args[0] if args else _ask(questionary.select("Regenerate fingerprint profil:",
+                choices=[n for n,_ in profiles()]))
+    if not name: print(c("  dibatalkan",C.Y)); return
+    pdir = ROOT/name; m = load(pdir)
+    if not m: print(c(f"  profil '{name}' tidak ada", C.RE)); return
+    os_name = None
+    if "--os" in args:
+        i = args.index("--os")
+        if i+1 < len(args): os_name = args[i+1]
+    if not os_name:
+        os_name = _ask(questionary.select("OS baru:",
+                    choices=[questionary.Choice(f"{o} (sekarang: {m['os']})", o)
+                             for o in ["windows","macos","linux"]]))
+        if not os_name: print(c("  dibatalkan",C.Y)); return
+    from camoufox.fingerprints import load_presets
+    pres = load_presets().get("presets", {})
+    vf = ROOT/"_valid.json"
+    valid = json.loads(vf.read_text()) if vf.exists() else None
+    good = (valid or {}).get(os_name) or list(range(len(pres[os_name])))
+    used = {mm.get("preset_id") for n,mm in profiles() if n != name}
+    avail = [i for i in good if f"{os_name}:{i}" not in used] or good
+    i = random.choice(avail)
+    FONTS = json.load(open(VENV/"lib/python3.12/site-packages/camoufox/fonts.json"))
+    omap = {"windows":"win","macos":"mac","linux":"lin"}
+    rng = random.Random(f"{os_name}:{i}-{random.randint(0,9999)}")
+    fl = FONTS[omap[os_name]]
+    n = rng.randint(180,320) if omap[os_name]=="mac" else rng.randint(55,85)
+    preset = dict(pres[os_name][i]); preset["fonts"] = sorted(rng.sample(fl, min(n,len(fl))))
+    old = m.get("preset_id")
+    m.update({"os":os_name, "preset_id":f"{os_name}:{i}", "preset":preset})
+    save(pdir, m)
+    print(c(f"  ✓ {name}: fingerprint diganti", C.G))
+    print(f"    {old}  →  {os_name}:{i}   proxy tetap {m.get('proxy_port')}")
+
+
+def act_info(args):
+    import questionary
+    name = args[0] if args else _ask(questionary.select("Lihat detail profil:",
+                choices=[n for n,_ in profiles()]))
+    if not name: return
+    m = load(ROOT/name)
+    if not m: print(c("  profil tidak ada", C.RE)); return
+    p=m["preset"]; nv=p.get("navigator",{}); sc=p.get("screen",{}); wg=p.get("webgl",{})
+    print(f"""
+  {c('profil',C.B)}    : {name}
+  {c('os',C.B)}        : {m['os']}   preset={m['preset_id']}
+  {c('UA',C.B)}        : {nv.get('userAgent')}
+  {c('platform',C.B)}  : {nv.get('platform')}   cores={nv.get('hardwareConcurrency')}
+  {c('screen',C.B)}    : {sc.get('width')}x{sc.get('height')}  avail={sc.get('availWidth')}x{sc.get('availHeight')}
+  {c('GPU',C.B)}       : {wg.get('unmaskedRenderer') or wg.get('renderer')}
+  {c('fonts',C.B)}     : {len(p.get('fonts',[]))} buah
+  {c('proxy',C.B)}     : {'TANPA PROXY (IP asli)' if m.get('proxy_port')=='__none__' else (m.get('proxy_port') or 'belum di-set')}
+""")
+
+
+def act_rm(args):
+    import questionary
+    name = args[0] if args else _ask(questionary.select("Hapus profil:",
+                choices=[n for n,_ in profiles()]))
+    if not name: return
+    d = ROOT/name
+    if not (d/"fingerprint.json").exists(): print(c("  profil tidak ada", C.RE)); return
+    ok = _ask(questionary.confirm(f"Yakin hapus '{name}'?", default=False))
+    if not ok: print(c("  dibatalkan",C.Y)); return
+    shutil.rmtree(d); print(c(f"  ✓ {name} dihapus", C.G))
+
+
+def act_newname(args):
+    if len(args)<2: print(c("  pakai: /newname <lama> <baru>", C.Y)); return
+    a,b = ROOT/args[0], ROOT/args[1]
+    if not (a/"fingerprint.json").exists(): print(c("  profil lama tidak ada", C.RE)); return
+    if (b/"fingerprint.json").exists(): print(c("  nama baru sudah dipakai", C.RE)); return
+    a.rename(b); m=load(b); m["profile"]=args[1]; save(b,m)
+    print(c(f"  ✓ {args[0]} → {args[1]}", C.G))
+
+
+# ---------------- TUI ----------------
+COMMANDS = ["/new","/list","/proxies","/run","/proxy","/info","/newfp","/newname","/rm","/help","/quit"]
+
+def complete_names(prefix):
+    try:
+        p = prefix.split()
+        if len(p) <= 1:
+            return [x for x in COMMANDS if x.startswith(prefix)]
+        if p[0] in ("/run","/proxy","/info","/rm","/newfp","/newname"):
+            return [" ".join(p[:-1]+[o]) for o in
+                    [n for n,_ in profiles() if n.startswith(p[-1])]]
+        if p[0]=="/proxies":
+            return ["/proxies","/proxies --test"]
+    except Exception: pass
+    return []
+
+def interactive():
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.history import InMemoryHistory
+    from prompt_toolkit.formatted_text import ANSI
+
+    class CC(Completer):
+        def get_completions(self, doc, ev):
+            txt = doc.text
+            for s in complete_names(txt):
+                yield Completion(s, start_position=-len(txt))
+
+    session = PromptSession(history=InMemoryHistory(), completer=CC(), complete_while_typing=True)
+    print(f"""
+{c('  ╭────────────────────────────────────────────╮',C.CY)}
+{c('  │',C.CY)}  {c('Camoufox Manager',C.B)}   {c('· cfm',C.D)}                    {c('│',C.CY)}
+{c('  ╰────────────────────────────────────────────╯',C.CY)}
+  {c('/new',C.CY)} profil baru     {c('/run',C.CY)} jalankan     {c('/list',C.CY)} daftar
+  {c('/proxy',C.CY)} ganti proxy  {c('/proxies',C.CY)} tes proxy   {c('/help',C.CY)} bantuan
+  {c('tab',C.D)}=autocomplete   {c('↑↓',C.D)}=riwayat   {c('←→',C.D)}=menu
+""")
+    dispatch = {
+        "/list": lambda a: show_list(),
+        "/proxies": lambda a: show_proxies("--test" in a),
+        "/new": act_new, "/run": act_run, "/proxy": act_proxy, "/info": act_info,
+        "/newfp": act_newfp, "/rm": act_rm, "/newname": act_newname,
+        "/help": lambda a: show_help(),
+        "/quit": lambda a: None,
+    }
+    while True:
+        try:
+            line = session.prompt(ANSI(c("cfm",C.M)+c("> ",C.D))).strip()
+        except (EOFError, KeyboardInterrupt):
+            print(); break
+        if not line: continue
+        if line in ("/quit","/exit","exit","quit"): break
+        p = line.split(); cmd, args = p[0], p[1:]
+        fn = dispatch.get(cmd)
+        if not fn and cmd.startswith("/"):
+            # exact match menang; kalau bukan, cari singkatan unik
+            if cmd not in dispatch:
+                cand = [k for k in dispatch if k.startswith(cmd)]
+                # /p dan /pro ambigu antara proxy & proxies → tampilkan pilihan
+                if len(cand) == 1:
+                    cmd = cand[0]; fn = dispatch[cmd]
+                    print(c(f"  → {cmd}", C.D))
+                elif len(cand) > 1:
+                    # pilih kandidat terpendek (biasanya yang dimaksud)
+                    cmd = min(cand, key=len); fn = dispatch[cmd]
+                    others = [k for k in cand if k != cmd]
+                    print(c(f"  → {cmd}", C.D) + c(f"   (lainnya: {', '.join(sorted(others))})", C.D))
+        if not fn:
+            print(c(f"  '{cmd}' tidak dikenal.  /help",C.Y)); continue
+        if cmd == "/quit": break
+        try: fn(args)
+        except Exception as e:
+            print(c(f"  error: {type(e).__name__}: {e}", C.RE))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="cfm")
+    ap.add_argument("cmd", nargs="?"); ap.add_argument("args", nargs="*")
+    ap.add_argument("--os", choices=["windows","macos","linux"])
+    ap.add_argument("--port", type=int); ap.add_argument("--bg", action="store_true")
+    ap.add_argument("--test", action="store_true"); ap.add_argument("--noproxy", action="store_true")
+    a = ap.parse_args()
+    if not a.cmd: interactive(); return
+    extra = []
+    if a.os: extra += ["--os", a.os]
+    if a.port: extra += ["--port", str(a.port)]
+    if a.noproxy: extra += ["--noproxy"]
+    d = {"list": lambda: show_list(),
+         "proxies": lambda: show_proxies(a.test),
+         "new": lambda: act_new(a.args + extra),
+         "run": lambda: act_run(a.args + (["--bg"] if a.bg else [])),
+         "proxy": lambda: act_proxy(a.args), "set": lambda: act_proxy(a.args),
+         "info": lambda: act_info(a.args), "newfp": lambda: act_newfp(a.args + extra),
+         "rm": lambda: act_rm(a.args), "newname": lambda: act_newname(a.args)}
+    fn = d.get(a.cmd)
+    if not fn: print(f"perintah tidak dikenal: {a.cmd}"); show_help(); return
+    fn()
+
+if __name__ == "__main__":
+    main()

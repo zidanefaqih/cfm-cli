@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# data lokal, jangan pernah masuk repo
+camfox-profiles/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+logs/
+*.log
+.proxy-cache.json
+
+# kredensial
+.env
+keys.env
+*.key
+*.conf
+!examples/*.conf.example
+*access-token*
+*.pem

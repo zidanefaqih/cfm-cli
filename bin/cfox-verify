@@ -1,0 +1,47 @@
+import os, json, time, shutil, sys
+os.environ.setdefault('XDG_CACHE_HOME', os.environ.get('CAMOUFOX_HOME', str(os.path.expanduser('~/.local/share/camoufox'))))
+os.environ['DISPLAY'] = ':1'
+from camoufox.sync_api import Camoufox
+
+src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cfox')).read()
+ns = {}
+exec(src[src.index('CHROME_H = 55'):src.index('def pick_preset')], ns)
+wg = ns['window_geometry']
+
+JS = ("()=>({sw:screen.width,sh:screen.height,aw:screen.availWidth,ah:screen.availHeight,"
+      "ow:outerWidth,oh:outerHeight,iw:innerWidth,ih:innerHeight,"
+      "dw:document.documentElement.clientWidth,dh:document.documentElement.clientHeight})")
+
+print(f"  {'PROFIL':<7}{'screen':<12}{'avail':<12}{'outer':<12}{'inner':<12}cek")
+allok = True
+for name in sys.argv[1:]:
+    m = json.load(open(os.path.expanduser(f'~/camfox-profiles/{name}/fingerprint.json')))
+    cfg = wg(m['os'], m['preset'], 1280, 800, headless=False)
+    tmp = f'/tmp/fc-{name}'
+    shutil.rmtree(tmp, ignore_errors=True)
+    port = m.get('proxy_port')
+    kw = dict(headless=False, persistent_context=True, user_data_dir=tmp, os=m['os'],
+              fingerprint_preset=m['preset'], main_world_eval=True, window=(1280, 800),
+              no_viewport=True, config=cfg, i_know_what_im_doing=True, locale="en-US")
+    if port and str(port).isdigit():
+        kw['proxy'] = {"server": f"socks5://127.0.0.1:{port}"}
+        kw['geoip'] = True
+    with Camoufox(**kw) as ctx:
+        pg = ctx.pages[0] if ctx.pages else ctx.new_page()
+        pg.goto("https://iphey.com")
+        time.sleep(4)
+        v = pg.evaluate(JS)
+    ck = {
+        'outer<=avail': v['oh'] <= v['ah'] and v['ow'] <= v['aw'],
+        'inner<=outer': v['ih'] <= v['oh'],
+        'client==inner': abs(v['dh'] - v['ih']) <= 2 and abs(v['dw'] - v['iw']) <= 2,
+        'chrome>0': v['oh'] > v['ih'],
+    }
+    ok = all(ck.values())
+    allok &= ok
+    bad = [k for k, x in ck.items() if not x]
+    print(f"  {name:<7}{v['sw']}x{v['sh']:<8}{v['aw']}x{v['ah']:<8}"
+          f"{v['ow']}x{v['oh']:<7}{v['iw']}x{v['ih']:<7}"
+          f"{'OK' if ok else 'LEAK: ' + ','.join(bad)}")
+print()
+print(f"  {'=> SEMUA AMAN' if allok else '=> MASIH ADA LEAK'}")

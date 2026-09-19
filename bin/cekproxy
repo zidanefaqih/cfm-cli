@@ -1,0 +1,70 @@
+#!/bin/bash
+echo "=== STATUS PROXY DOLPHIN & HOTSPOT ==="
+
+# Check WiFi interface
+WIFI_STATUS=$(cat /sys/class/net/wlp7s0/operstate 2>/dev/null)
+WIFI_IP=$(ip -4 addr show dev wlp7s0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+
+if [ "$WIFI_STATUS" = "up" ] && [ -n "$WIFI_IP" ]; then
+    SSID=$(nmcli -t -f active,ssid dev wifi 2>/dev/null | grep '^yes:' | cut -d: -f2)
+    [ -z "$SSID" ] && SSID="iPhone"
+    echo -e "\e[32m[✓] Wi-Fi Hotspot :\e[0m TERHUBUNG ke '$SSID' ($WIFI_IP)"
+else
+    echo -e "\e[31m[✗] Wi-Fi Hotspot :\e[0m TERPUTUS (Mode Pesawat / Hotspot Mati)"
+fi
+
+# Check Port 1080 (MicroSocks / hotspot)
+if ss -tulpn 2>/dev/null | grep -q ":1080\b"; then
+    echo -e "\e[32m[✓] Port Proxy 1080:\e[0m AKTIF (MicroSocks Running)"
+else
+    echo -e "\e[31m[✗] Port Proxy 1080:\e[0m MATI (Inactive)"
+fi
+
+# Check IP Internet via Proxy 1080
+if ss -tulpn 2>/dev/null | grep -q ":1080\b"; then
+    PROXY_IP=$(curl -s -m 3 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org 2>/dev/null)
+    if [ -n "$PROXY_IP" ]; then
+        echo -e "\e[32m[✓] IP Dolphin     :\e[0m $PROXY_IP (Siap dipakai!)"
+    else
+        echo -e "\e[33m[!] IP Dolphin     :\e[0m Menunggu jalur internet..."
+    fi
+else
+    echo -e "\e[90m[-] IP Dolphin     : -\e[0m"
+fi
+
+# ===== SURFSHARK (wireproxy) =====
+echo "--- Surfshark (wireproxy) ---"
+SS_FOUND=0
+# port dibaca dinamis dari config wireproxy
+PORTS=$(grep -rhoE 'BindAddress\s*=\s*127\.0\.0\.1:[0-9]+' "$HOME/surfshark-proxy/configs/"*.conf 2>/dev/null | grep -oE '[0-9]+$' | sort -n | tr '\n' ' ')
+[ -z "$PORTS" ] && PORTS="1081 1082 1083 1084 1085"
+for PORT in $PORTS; do
+    if ss -tulpn 2>/dev/null | grep -q ":$PORT\b"; then
+        SS_FOUND=1
+        SS_IP=$(curl -s -m 8 --socks5-hostname 127.0.0.1:$PORT https://api.ipify.org 2>/dev/null)
+        if [ -n "$SS_IP" ]; then
+            SS_LOC=$(curl -s -m 8 --socks5-hostname 127.0.0.1:$PORT "http://ip-api.com/json/$SS_IP?fields=country,city,isp,hosting" 2>/dev/null | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    dc=' [DC]' if d.get('hosting') else ''
+    print(f\"{d.get('country','?')}/{d.get('city','?')} | {d.get('isp','?')[:22]}{dc}\")
+except: print('?')
+" 2>/dev/null)
+            echo -e "\e[32m[✓] Port $PORT     :\e[0m $SS_IP  ($SS_LOC)"
+        else
+            echo -e "\e[33m[!] Port $PORT     :\e[0m listen tapi belum konek"
+        fi
+    fi
+done
+if [ "$SS_FOUND" = "0" ]; then
+    echo -e "\e[31m[✗] Surfshark     :\e[0m MATI (wireproxy tidak jalan)"
+    echo -e "\e[90m    start: ss-up\e[0m"
+fi
+
+# Check LAN Host IP
+HOST_IP=$(curl -s -m 2 https://api.ipify.org 2>/dev/null)
+if [ -n "$HOST_IP" ]; then
+    echo -e "\e[36m[*] IP PC Host (LAN):\e[0m $HOST_IP (Indihome Kabel)"
+fi
+echo "======================================"

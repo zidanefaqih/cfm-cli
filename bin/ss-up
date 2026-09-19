@@ -1,0 +1,28 @@
+#!/bin/bash
+# Nyalakan Surfshark wireproxy (baca semua config di ~/surfshark-proxy/configs/)
+CONFDIR="$HOME/surfshark-proxy/configs"
+LOGDIR="$HOME/surfshark-proxy/logs"
+mkdir -p "$LOGDIR"
+COUNT=0
+for CONF in "$CONFDIR"/*.conf; do
+    [ -f "$CONF" ] || continue
+    NAME=$(basename "$CONF" .conf)
+    PORT=$(grep -A2 '\[Socks5\]' "$CONF" | grep -oP '(?<=:)\d+$' | head -1)
+    [ -z "$PORT" ] && continue
+    if pgrep -f "wireproxy -c $CONF" >/dev/null 2>&1; then
+        echo -e "\e[33m[=] $NAME (port $PORT) sudah jalan\e[0m"; continue
+    fi
+    setsid bash -c "exec $HOME/.local/bin/wireproxy -c '$CONF' > '$LOGDIR/$NAME.log' 2>&1" < /dev/null &
+    sleep 1
+    echo -e "\e[32m[+] $NAME (port $PORT) dinyalakan\e[0m"
+    COUNT=$((COUNT+1))
+done
+sleep 6
+echo "---"
+for CONF in "$CONFDIR"/*.conf; do
+    [ -f "$CONF" ] || continue
+    PORT=$(grep -A2 '\[Socks5\]' "$CONF" | grep -oP '(?<=:)\d+$' | head -1)
+    [ -z "$PORT" ] && continue
+    IP=$(curl -s -m 8 --socks5-hostname 127.0.0.1:$PORT https://api.ipify.org 2>/dev/null)
+    [ -n "$IP" ] && echo -e "\e[32m[✓]\e[0m port $PORT -> $IP" || echo -e "\e[31m[✗]\e[0m port $PORT gagal"
+done
