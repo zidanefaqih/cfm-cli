@@ -1,2 +1,2 @@
 #!/bin/bash
-pkill -f "wireproxy -c" 2>/dev/null && echo -e "\e[33m[*] Semua wireproxy dimatikan\e[0m" || echo -e "\e[90m[-] Tidak ada wireproxy jalan\e[0m"
+pkill -f "wireproxy -c" 2>/dev/null && echo -e "\e[33m[*] All wireproxy processes stopped\e[0m" || echo -e "\e[90m[-] No wireproxy process was running\e[0m"

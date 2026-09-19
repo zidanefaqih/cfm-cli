@@ -12,7 +12,7 @@ JS = ("()=>({sw:screen.width,sh:screen.height,aw:screen.availWidth,ah:screen.ava
       "ow:outerWidth,oh:outerHeight,iw:innerWidth,ih:innerHeight,"
       "dw:document.documentElement.clientWidth,dh:document.documentElement.clientHeight})")
 
-print(f"  {'PROFIL':<7}{'screen':<12}{'avail':<12}{'outer':<12}{'inner':<12}cek")
+print(f"  {'PROFILE':<7}{'screen':<12}{'avail':<12}{'outer':<12}{'inner':<12}check")
 allok = True
 for name in sys.argv[1:]:
     m = json.load(open(os.path.expanduser(f'~/camfox-profiles/{name}/fingerprint.json')))
@@ -44,4 +44,4 @@ for name in sys.argv[1:]:
           f"{v['ow']}x{v['oh']:<7}{v['iw']}x{v['ih']:<7}"
           f"{'OK' if ok else 'LEAK: ' + ','.join(bad)}")
 print()
-print(f"  {'=> SEMUA AMAN' if allok else '=> MASIH ADA LEAK'}")
+print(f"  {'=> ALL PROFILES OK' if allok else '=> LEAK STILL PRESENT'}")

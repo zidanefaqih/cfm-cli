@@ -1,5 +1,5 @@
 #!/bin/bash
-echo "=== STATUS PROXY DOLPHIN & HOTSPOT ==="
+echo "=== PROXY STATUS: HOTSPOT & VPN POOL ==="
 
 # Check WiFi interface
 WIFI_STATUS=$(cat /sys/class/net/wlp7s0/operstate 2>/dev/null)
@@ -8,16 +8,16 @@ WIFI_IP=$(ip -4 addr show dev wlp7s0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d
 if [ "$WIFI_STATUS" = "up" ] && [ -n "$WIFI_IP" ]; then
     SSID=$(nmcli -t -f active,ssid dev wifi 2>/dev/null | grep '^yes:' | cut -d: -f2)
     [ -z "$SSID" ] && SSID="iPhone"
-    echo -e "\e[32m[✓] Wi-Fi Hotspot :\e[0m TERHUBUNG ke '$SSID' ($WIFI_IP)"
+    echo -e "\e[32m[✓] Wi-Fi Hotspot :\e[0m CONNECTED to '$SSID' ($WIFI_IP)"
 else
-    echo -e "\e[31m[✗] Wi-Fi Hotspot :\e[0m TERPUTUS (Mode Pesawat / Hotspot Mati)"
+    echo -e "\e[31m[✗] Wi-Fi Hotspot :\e[0m DISCONNECTED (airplane mode / hotspot off)"
 fi
 
 # Check Port 1080 (MicroSocks / hotspot)
 if ss -tulpn 2>/dev/null | grep -q ":1080\b"; then
-    echo -e "\e[32m[✓] Port Proxy 1080:\e[0m AKTIF (MicroSocks Running)"
+    echo -e "\e[32m[✓] Port Proxy 1080:\e[0m UP (microsocks running)"
 else
-    echo -e "\e[31m[✗] Port Proxy 1080:\e[0m MATI (Inactive)"
+    echo -e "\e[31m[✗] Port Proxy 1080:\e[0m DOWN (inactive)"
 fi
 
 # Check IP Internet via Proxy 1080
@@ -35,7 +35,7 @@ fi
 # ===== SURFSHARK (wireproxy) =====
 echo "--- Surfshark (wireproxy) ---"
 SS_FOUND=0
-# port dibaca dinamis dari config wireproxy
+# ports are read dynamically from the wireproxy configs
 PORTS=$(grep -rhoE 'BindAddress\s*=\s*127\.0\.0\.1:[0-9]+' "$HOME/surfshark-proxy/configs/"*.conf 2>/dev/null | grep -oE '[0-9]+$' | sort -n | tr '\n' ' ')
 [ -z "$PORTS" ] && PORTS="1081 1082 1083 1084 1085"
 for PORT in $PORTS; do
@@ -53,13 +53,13 @@ except: print('?')
 " 2>/dev/null)
             echo -e "\e[32m[✓] Port $PORT     :\e[0m $SS_IP  ($SS_LOC)"
         else
-            echo -e "\e[33m[!] Port $PORT     :\e[0m listen tapi belum konek"
+            echo -e "\e[33m[!] Port $PORT     :\e[0m listening but not connected"
         fi
     fi
 done
 if [ "$SS_FOUND" = "0" ]; then
-    echo -e "\e[31m[✗] Surfshark     :\e[0m MATI (wireproxy tidak jalan)"
-    echo -e "\e[90m    start: ss-up\e[0m"
+    echo -e "\e[31m[✗] Surfshark     :\e[0m DOWN (wireproxy not running)"
+    echo -e "\e[90m    start with: ss-up\e[0m"
 fi
 
 # Check LAN Host IP

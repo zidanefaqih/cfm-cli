@@ -1,23 +1,23 @@
-# dibaca cfm: satu .conf per port SOCKS5.
-# Format minimal yang perlu:
+# Read by cfm: one .conf per SOCKS5 port.
+# The minimum the tooling needs:
 
 [Socks5]
 BindAddress = 127.0.0.1:1091
 
-# Contoh lengkap dengan WireGuard (wireproxy):
+# Full example with WireGuard (wireproxy):
 #
 # [Interface]
 # Address = 10.14.0.2/16
-# PrivateKey = <kunci-privat-anda>
+# PrivateKey = <your-private-key>
 # DNS = 162.252.172.57
 #
 # [Peer]
-# PublicKey = <kunci-publik-server>
+# PublicKey = <server-public-key>
 # AllowedIPs = 0.0.0.0/0
 # Endpoint = sg-sng-st005.example.com:51820
 #
 # [Socks5]
 # BindAddress = 127.0.0.1:1091
 #
-# Port harus unik per berkas. cfox-fullscreen.py dan cekproxy membaca direktori
-# ~/surfshark-proxy/configs/ secara otomatis, jadi menambah berkas baru sudah cukup.
+# Ports must be unique per file. cfm and cekproxy scan
+# ~/surfshark-proxy/configs/ automatically, so adding a file is enough.

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Pindahkan window Camoufox ke fullscreen di monitor LANDSCAPE (HDMI-0).
+"""Move the Camoufox window to fullscreen on the LANDSCAPE monitor (HDMI-0).
 
-Dipakai cfox sebagai thread background setelah browser terbuka.
-KWin mendukung _NET_WM_STATE_FULLSCREEN dan _NET_WM_FULLSCREEN_MONITORS,
-sehingga window bisa dipaksa fullscreen pada monitor tertentu.
+Invoked by cfox as a background thread once the browser is up.
+KWin supports _NET_WM_STATE_FULLSCREEN and _NET_WM_FULLSCREEN_MONITORS, so the
+window can be forced fullscreen on one specific monitor.
 
-Argumen: <nama-profil>   (dicari lewat cmdline proses camoufox-bin)
-Pakai python sistem karena venv tidak punya python-xlib.
+Argument: <profile-name>   (located via the camoufox-bin process cmdline)
+Uses the system python because the Camoufox venv has no python-xlib.
 """
 import sys, time, subprocess, os
 
 DISPLAY = os.environ.get("DISPLAY", ":1")
-# Monitor landscape (dari `xrandr`): HDMI-0 1920x1080 di +0+650, x=0 → monitor #0.
+# Landscape monitor (from `xrandr`): HDMI-0 1920x1080 at +0+650, x=0 -> monitor #0.
 LANDSCAPE_MON = 0
 
 
@@ -24,7 +24,7 @@ def _py(code, timeout=15):
 
 
 def find_window(profile):
-    """Cari window X11 milik proses camoufox yang membuka profil tsb."""
+    """Find the X11 window of the camoufox process that opened this profile."""
     code = r'''
 import os, glob
 from Xlib import display, X
@@ -74,7 +74,7 @@ for f in found: print(f[0], f[1], f[2])
 
 
 def force_fullscreen(wid, mon=LANDSCAPE_MON):
-    """Kirim _NET_WM_STATE_FULLSCREEN + _NET_WM_FULLSCREEN_MONITORS ke KWin."""
+    """Send _NET_WM_STATE_FULLSCREEN and _NET_WM_FULLSCREEN_MONITORS to KWin."""
     code = r'''
 import os
 from Xlib import display, X, protocol
@@ -99,19 +99,19 @@ print("ok")
 
 def main():
     if len(sys.argv) < 2:
-        print("[fs] butuh nama profil", flush=True)
+        print("[fs] a profile name is required", flush=True)
         return
     profile = sys.argv[1]
     wid = None
-    for _ in range(60):          # sampai 30 detik
+    for _ in range(60):          # up to 30 seconds
         wid = find_window(profile)
         if wid:
             break
         time.sleep(0.5)
     if not wid:
-        print(f"[fs] window '{profile}' tidak ditemukan", flush=True)
+        print(f"[fs] window for '{profile}' not found", flush=True)
         return
-    time.sleep(1.0)              # beri KWin waktu menyelesaikan mapping
+    time.sleep(1.0)              # give KWin time to finish mapping
     ok = force_fullscreen(wid)
     print(f"[fs] {profile} wid={hex(wid)} fullscreen={ok}", flush=True)
 

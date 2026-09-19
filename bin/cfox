@@ -2,23 +2,27 @@
 """
 Camoufox multi-profile launcher.
 
-1 profil = 1 fingerprint PERMANEN (dari 123 preset siap pakai).
-Fingerprint di-pilih sekali saat profil dibuat, disimpan, lalu dipakai terus.
-Setiap profil dapet hardware/GPU/screen/UA yang beda dan KONSISTEN.
+1 profile = 1 PERMANENT fingerprint (chosen from 123 real-device presets).
+The fingerprint is picked once at profile creation, saved, then reused on every
+run. Each profile gets a different, consistent hardware/GPU/screen/UA.
 
-  cfox acc1 --port 1091              # buat/ pakai profil acc1
-  cfox acc1 --new                    # regenerate fingerprint profil acc1
-  cfox acc1 --show                   # lihat identitas tersimpan
-  cfox --list                       # daftar semua profil
+  cfox acc1 --port 1091              # create or reuse profile acc1
+  cfox acc1 --new                    # regenerate the profile fingerprint
+  cfox acc1 --show                   # print the stored identity
+  cfox --list                        # list all profiles
 """
 import argparse, json, os as _os, pathlib, sys, secrets, random
 
-# --- Camoufox install dir JANGAN di ~/.cache (gampang kehapus oleh 'rm -rf ~/.cache/*') ---
-# Pindahkan install binary ke ~/.local/share/camoufox-setup/camoufox.
+# --- Keep the Camoufox install OUT of ~/.cache -------------------------------
+# That path is treated as disposable, and a routine 'rm -rf ~/.cache/*' removes
+# the ~1.3 GB browser install. Default: ~/.local/share/camoufox
 if not _os.environ.get("XDG_CACHE_HOME"):
-    _os.environ["XDG_CACHE_HOME"] = str(pathlib.Path(os.environ.get("CAMOUFOX_INSTALL_DIR", pathlib.Path.home()/".local"/"share"/"camoufox")))
+    _os.environ["XDG_CACHE_HOME"] = str(
+        pathlib.Path(_os.environ.get("CAMOUFOX_HOME",
+                                     pathlib.Path.home() / ".local" / "share" / "camoufox"))
+    )
 
-# Pastikan DISPLAY ter-set (wajib buat mode headful / window tampil)
+# Make sure DISPLAY is set (required for headful mode).
 if not _os.environ.get("DISPLAY"):
     for _d in ("/tmp/.X11-unix",):
         try:
@@ -33,21 +37,23 @@ from camoufox.fingerprints import load_presets, get_random_preset
 
 ROOT = pathlib.Path.home() / "camfox-profiles"
 OS_LIST = ["windows", "macos", "linux"]
-CAMO_HOME = pathlib.Path(os.environ.get("CAMOUFOX_INSTALL_DIR", pathlib.Path.home()/".local"/"share"/"camoufox"))
+CAMO_HOME = pathlib.Path(
+    _os.environ.get("CAMOUFOX_HOME", pathlib.Path.home() / ".local" / "share" / "camoufox")
+)
 
 
 def camo_ready():
-    """Cek binary Camoufox ada. Kembalikan (ok, pesan)."""
+    """Check that the Camoufox binary exists. Returns (ok, message)."""
     cfg = CAMO_HOME / "camoufox" / "config.json"
     if not cfg.exists():
-        return False, f"install dir kosong: {cfg.parent}"
+        return False, f"install dir is empty: {cfg.parent}"
     try:
         active = json.loads(cfg.read_text()).get("active_version", "")
     except Exception:
-        return False, "config.json rusak"
+        return False, "config.json is corrupt"
     b = CAMO_HOME / "camoufox" / active / "camoufox-bin"
     if not b.exists():
-        return False, f"binary tidak ada: {b}"
+        return False, f"binary missing: {b}"
     return True, str(b)
 
 
@@ -56,7 +62,11 @@ VALID_CACHE = ROOT / "_valid.json"
 
 
 def valid_indices(os_name: str):
-    """Index preset yang WebGL-nya ada di database Camoufox (sisanya bikin crash)."""
+    """Preset indexes whose WebGL entry exists in Camoufox's database.
+
+    Presets outside this list crash the browser with:
+      No WebGL data found for vendor ... and renderer ...
+    """
     if not VALID_CACHE.exists():
         return None
     try:
@@ -65,31 +75,32 @@ def valid_indices(os_name: str):
         return None
 
 
-# ---- geometri window -------------------------------------------------------
-# Tinggi UI Firefox (tab bar + address bar). Diukur dari BrowserForge asli.
+# ---- window geometry --------------------------------------------------------
+# Firefox UI height (tab bar + address bar). Measured from real BrowserForge output.
 CHROME_H = 55
-# Tinggi taskbar/panel/dock per OS, mengikuti Camoufox fix_screen_no_taskbar().
+# Taskbar/panel/dock height per OS, matching Camoufox fix_screen_no_taskbar().
 TASKBAR = {"macos": 25, "windows": 40, "linux": 27}
 
 
 def window_geometry(os_name, preset, want_w, want_h, headless=False):
-    """Hitung screen.* dan window.* yang KONSISTEN.
+    """Compute a CONSISTENT set of screen.* and window.* values.
 
-    Kenapa perlu: kalau memakai fingerprint_preset, Camoufox melewatkan
-    generate_fingerprint() sehingga window.* tidak pernah di-spoof, dan
-    clamp_window_dimensions()/fix_screen_no_taskbar() juga ikut mati begitu kita
-    menulis window.* sendiri (_user_set_screen_window=True). Jadi semua bound
-    dihitung di sini:
+    Why this is needed: with fingerprint_preset, Camoufox skips
+    generate_fingerprint(), so window.* is never spoofed. Worse, as soon as we
+    write window.* ourselves (_user_set_screen_window becomes True), Camoufox
+    disables clamp_window_dimensions() and fix_screen_no_taskbar() entirely.
+    So every bound is enforced here:
+
         inner <= outer <= avail <= screen
-        screen.availHeight < screen.height   (jangan flip flag noTaskbar)
+        screen.availHeight < screen.height   (never flip the noTaskbar flag)
     """
     s = preset.get("screen", {}) or {}
     sw = int(s.get("width") or 1920)
     sh = int(s.get("height") or 1080)
 
-    # Headful: screen tidak boleh lebih besar dari monitor asli, jika tidak
-    # Camoufox memotongnya sendiri (clamp_screen_to_display) dan profil jadi
-    # tidak sesuai preset.
+    # Headful: the spoofed screen must not exceed the real monitor, otherwise
+    # Camoufox clamps it itself (clamp_screen_to_display) and the profile no
+    # longer matches its preset.
     if not headless:
         try:
             from camoufox.utils import get_screen_cons
@@ -100,17 +111,18 @@ def window_geometry(os_name, preset, want_w, want_h, headless=False):
         except Exception:
             pass
 
-    # availHeight: HORMATI nilai preset bila wajar (taskbar 1..200px).
-    # Preset linux sering punya availHeight == height (noTaskbar) -> baru difix.
+    # availHeight: KEEP the preset value when it is plausible (taskbar 1..200px).
+    # Linux presets often ship availHeight == height (noTaskbar) -> only those
+    # get recomputed from the table above.
     tb = TASKBAR.get(os_name, 27)
     ah_preset = s.get("availHeight")
     if ah_preset and 0 < (sh - int(ah_preset)) < 200:
         ah = int(ah_preset)
     else:
         ah = max(sh - tb, 400)
-    ah = min(ah, sh - 1) if sh > 1 else ah        # jangan sampai == height
+    ah = min(ah, sh - 1) if sh > 1 else ah        # never equal to height
 
-    # window WAJIB muat di avail: outer <= avail <= screen
+    # The window MUST fit inside avail: outer <= avail <= screen.
     w = max(min(want_w, sw), 400)
     h = max(min(want_h, ah), 300)
     ih = max(h - CHROME_H, 200)
@@ -125,7 +137,7 @@ def window_geometry(os_name, preset, want_w, want_h, headless=False):
 
 
 def pick_preset(os_name: str) -> dict:
-    """Ambil preset VALID acak, hindari yang sudah dipakai profil lain."""
+    """Pick a random VALID preset, preferring ones not used by other profiles."""
     pres = load_presets().get("presets", {})
     pool = pres.get(os_name) or pres.get("windows")
     good = valid_indices(os_name) or list(range(len(pool)))
@@ -142,7 +154,7 @@ def pick_preset(os_name: str) -> dict:
 
 def list_profiles():
     if not ROOT.exists():
-        print("belum ada profil"); return
+        print("no profiles yet"); return
     rows = []
     for d in sorted(ROOT.iterdir()):
         f = d / "fingerprint.json"
@@ -156,33 +168,33 @@ def list_profiles():
     print("-"*62)
     for r in rows:
         print(f"{r[0]:<12}{r[1]:<10}{str(r[2]):<14}{str(r[3]):<7}{str(r[4]):<10}{r[5] or '-'}")
-    print(f"\ntotal: {len(rows)} profil")
+    print(f"\ntotal: {len(rows)} profiles")
 
 
 def main():
-    p = argparse.ArgumentParser(description="Camoufox multi-profile")
-    p.add_argument("profile", nargs="?", help="nama profil")
-    p.add_argument("--port", type=int, default=0, help="port SOCKS5")
-    p.add_argument("--os", default=None, choices=OS_LIST, help="OS (default: acak saat profil baru)")
+    p = argparse.ArgumentParser(description="Camoufox multi-profile launcher")
+    p.add_argument("profile", nargs="?", help="profile name")
+    p.add_argument("--port", type=int, default=0, help="local SOCKS5 port")
+    p.add_argument("--os", default=None, choices=OS_LIST, help="OS (random when creating a new profile)")
     p.add_argument("--url", default="https://iphey.com")
     p.add_argument("--headless", action="store_true")
-    p.add_argument("--new", action="store_true", help="REGENERATE fingerprint profil ini")
-    p.add_argument("--show", action="store_true", help="lihat identitas tersimpan")
-    p.add_argument("--list", action="store_true", help="daftar semua profil")
-    p.add_argument("--win", default=None, help="ukuran window WxH (default 1280x800)")
-    p.add_argument("--fresh", action="store_true", help="mulai sesi baru (buang tab lama)")
-    p.add_argument("--no-fs", action="store_true", help="jangan fullscreen otomatis")
+    p.add_argument("--new", action="store_true", help="REGENERATE this profile's fingerprint")
+    p.add_argument("--show", action="store_true", help="print the stored identity")
+    p.add_argument("--list", action="store_true", help="list all profiles")
+    p.add_argument("--win", default=None, help="window size WxH (default 1280x800)")
+    p.add_argument("--fresh", action="store_true", help="start a fresh session (drop old tabs)")
+    p.add_argument("--no-fs", action="store_true", help="skip automatic fullscreen")
     a = p.parse_args()
 
     if a.list:
         list_profiles(); return
     if not a.profile:
-        p.error("nama profil wajib (atau pakai --list)")
+        p.error("a profile name is required (or use --list)")
 
-    # guard: pastikan binary Camoufox ada (bukan di ~/.cache, gampang kehapus)
+    # guard: make sure the Camoufox binary is present
     ok, info = camo_ready()
     if not ok:
-        print(f"\n  ❌ Camoufox tidak siap: {info}")
+        print(f"\n  Camoufox is not ready: {info}")
         print("  Fix:\n    camoufox fetch\n")
         sys.exit(1)
 
@@ -204,39 +216,39 @@ def main():
     nav = preset.get("navigator", {})
 
     if a.show:
-        print(f"profil   : {a.profile}")
+        print(f"profile  : {a.profile}")
         print(f"os       : {os_name}")
         print(f"preset   : {meta.get('preset_id')}")
         print(f"UA       : {nav.get('userAgent')}")
         print(f"platform : {nav.get('platform')}  cores={nav.get('hardwareConcurrency')}")
         print(f"screen   : {preset.get('screen',{}).get('width')}x{preset.get('screen',{}).get('height')}")
         print(f"webgl    : {json.dumps(preset.get('webgl',{}), default=str)[:140]}")
-        print(f"created  : {meta.get('created', '(lama)')}")
+        print(f"created  : {meta.get('created', '(older)')}")
         return
 
     if a.port:
         meta["proxy_port"] = a.port
         fpath.write_text(json.dumps(meta, indent=1))
 
-    print(f"[+] {a.profile}  os={os_name}  preset={meta.get('preset_id')}  {'BARU' if is_new else 'tersimpan'}")
+    print(f"[+] {a.profile}  os={os_name}  preset={meta.get('preset_id')}  {'NEW' if is_new else 'stored'}")
     print(f"    UA      : {nav.get('userAgent','')[:70]}")
     print(f"    cores   : {nav.get('hardwareConcurrency')}   screen: {preset.get('screen',{}).get('width')}x{preset.get('screen',{}).get('height')}")
-    print(f"    proxy   : {'127.0.0.1:'+str(a.port) if a.port else 'TIDAK ADA (IP asli!)'}")
+    print(f"    proxy   : {'127.0.0.1:'+str(a.port) if a.port else 'NONE (real IP!)'}")
 
-    # prefs Firefox: aktifkan session restore (tab terakhir dibuka lagi)
+    # Firefox preferences. Session restore stays off on purpose: cookies, logins
+    # and history persist regardless, and a corrupt recovery file used to hang
+    # startup.
     ff_prefs = {
-        "browser.startup.page": 0,             # 3 = restore sesi sebelumnya
+        "browser.startup.page": 0,             # 3 = restore previous session
         "browser.startup.homepage": a.url,
         "browser.sessionstore.resume_from_crash": False,
         "browser.sessionstore.max_tabs_undo": 20,
-        "browser.sessionstore.interval": 5000,  # simpan tiap 5 detik
+        "browser.sessionstore.interval": 5000,  # save every 5s
         "browser.tabs.warnOnClose": False,
         "browser.warnOnQuit": False,
         "toolkit.legacyUserProfileCustomizations.stylesheets": True,
-        # posisi & ukuran window
     }
 
-    # ukuran window: jangan lebih besar dari layar, sisakan ruang buat title bar
     win_w, win_h = 1280, 800
     if a.win and "x" in a.win:
         try:
@@ -249,22 +261,22 @@ def main():
         user_data_dir=str(pdir),
         window=(win_w, win_h),
         os=os_name,
-        fingerprint_preset=preset,     # <-- kunci: preset yg sama tiap run
+        fingerprint_preset=preset,     # key: the same preset on every run
         humanize=True,
         locale="en-US",
         headless=a.headless,
         main_world_eval=True,
-        # no_viewport: tanpa ini Playwright memaksa viewport 1280x720, sehingga
-        # window fullscreen hanya menampilkan halaman di pojok kiri-atas.
+        # no_viewport: without it Playwright forces a 1280x720 viewport, so a
+        # fullscreen window only renders the page in the top-left corner.
         no_viewport=True,
-        # geometri eksplisit: dengan fingerprint_preset, Camoufox melewati
-        # generate_fingerprint() sehingga window.* tidak pernah di-spoof dan
-        # clamp_window_dimensions() ikut mati. Akibatnya window hasil generate
-        # bisa lebih tinggi dari availHeight (outer 1130 vs avail 1050) =
-        # geometri mustahil. Semua bound dihitung di window_geometry().
+        # Explicit geometry: with fingerprint_preset, Camoufox skips
+        # generate_fingerprint(), so window.* is never spoofed and
+        # clamp_window_dimensions() is disabled. The generated window could end
+        # up taller than availHeight (outer 1130 vs avail 1050), which is an
+        # impossible geometry. Every bound is computed in window_geometry().
         config=window_geometry(os_name, preset, win_w, win_h, headless=a.headless),
-        # config menulis screen.*/window.*, jadi seluruh auto-clamp Camoufox mati;
-        # nilai sudah dibatasi sendiri dan penulisan manual ini disengaja.
+        # Writing screen.*/window.* disables all of Camoufox's auto-clamping;
+        # the values are already bounded above, so this is intentional.
         i_know_what_im_doing=True,
         firefox_user_prefs=ff_prefs,
     )
@@ -273,12 +285,14 @@ def main():
         kw["geoip"] = True
 
     with Camoufox(**kw) as ctx:
-        # persistent_context sudah membuka 1 window — pakai itu, jangan buat baru
+        # persistent_context already opened one window - reuse it, don't create
+        # a second one.
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-        # Fullscreen otomatis di monitor landscape (biar tidak bingung).
-        # Dijalankan sebagai thread: Kamoufox window baru muncul ~1s setelah ctx siap.
-        # Hanya headful + ada DISPLAY. Hilangkan dengan --no-fs.
+        # Automatic fullscreen on the landscape monitor, so profiles don't get
+        # lost across displays. Runs as a thread because the browser window
+        # appears ~1s after the context is ready. Headful + DISPLAY only.
+        # Disable with --no-fs.
         if not a.headless and not a.no_fs and _os.environ.get("DISPLAY"):
             import threading, subprocess as _sp
             _fs = pathlib.Path.home() / ".local" / "bin" / "cfox-fullscreen.py"
@@ -291,12 +305,12 @@ def main():
                         pass
                 threading.Thread(target=_mkfull, daemon=True).start()
 
-        # kalau bukan restore, paksa ke URL awal
+        # Unless restoring a session, force the initial URL.
         if a.url and (a.url != "https://iphey.com" or not page.url or page.url == "about:blank"):
             page.goto(a.url)
         else:
             try:
-                if not page.url or page.url in ("about:blank",""):
+                if not page.url or page.url in ("about:blank", ""):
                     page.goto(a.url)
             except Exception:
                 pass
@@ -305,11 +319,12 @@ def main():
             return
 
         if sys.stdin.isatty():
-            try: input("    [ENTER tutup] ")
+            try: input("    [ENTER to close] ")
             except (EOFError, KeyboardInterrupt): pass
         else:
-            # dijalankan di background (nohup/setsid): tahan sampai browser ditutup manual
-            print("    mode background - tutup window untuk keluar")
+            # Launched in the background (nohup/setsid): stay alive until the
+            # window is closed manually.
+            print("    background mode - close the window to exit")
             try:
                 while True:
                     page.wait_for_timeout(2000)
