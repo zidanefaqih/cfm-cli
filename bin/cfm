@@ -23,6 +23,7 @@ if not _os.environ.get("DISPLAY"):
 
 ROOT    = pathlib.Path.home() / "camfox-profiles"
 CONFDIR = pathlib.Path.home() / "surfshark-proxy" / "configs"
+PROXYURLDIR = CONFDIR  # *.url files with remote proxy URLs live next to wireproxy confs
 VENV    = pathlib.Path.home() / ".camoufox-venv"
 CFOX    = pathlib.Path.home() / ".local/bin/cfox"
 HOTSPOT = 1080
@@ -61,9 +62,52 @@ def proxy_choices(include_none=True):
         alive = v.get("alive", port_open(v["port"]))
         mark = "✓" if alive else "✗"
         items.append((f"{mark} {v['port']:>5}  {k:<18} {v['desc'][:34]}", v["port"]))
+    # remote proxies: one *.url file per proxy in CONFDIR, contents = proxy URL
+    for f in sorted(PROXYURLDIR.glob("*.url")) if PROXYURLDIR.exists() else []:
+        line = next((l.strip() for l in f.read_text().splitlines()
+                     if l.strip() and not l.startswith("#")), None)
+        if not line:
+            continue
+        scheme, userinfo, hostport = _split_url(line)
+        alive = _url_alive(scheme, userinfo, hostport)
+        mark = "✓" if alive else "✗"
+        items.append((f"{mark}   ⋀   {f.stem:<18} {_mask_url(line)[:44]}", line))
     if include_none:
         items.append(("-  no proxy (use real IP!)", "__none__"))
     return items
+
+
+def _split_url(url):
+    m = re.match(r"^(https?|socks5)://(.*)$", url, re.I)
+    scheme = m.group(1).lower() if m else "http"
+    rest = m.group(2) if m else url
+    if "@" in rest:
+        userinfo, _, hostport = rest.rpartition("@")
+    else:
+        userinfo, hostport = "", rest
+    return scheme, userinfo, hostport
+
+
+def _mask_url(url):
+    scheme, userinfo, hostport = _split_url(url)
+    if userinfo and ":" in userinfo:
+        return f"{scheme}://{userinfo.split(':',1)[0]}:***@{hostport}"
+    return url
+
+
+def _url_alive(scheme, userinfo, hostport, timeout=9):
+    try:
+        pre = []
+        if userinfo:
+            u, _, p = userinfo.partition(":")
+            pre = ["-x", f"{scheme}://{u}:{p}@{hostport}"]
+        else:
+            pre = ["-x", f"{scheme}://{hostport}"]
+        r = subprocess.run(["curl","-s","-m",str(timeout),*pre,"https://ipinfo.io/ip"],
+                           capture_output=True, text=True, timeout=timeout+5)
+        return bool(r.stdout.strip())
+    except Exception:
+        return False
 
 def proxy_ip(port, timeout=9):
     try:
@@ -243,10 +287,32 @@ def act_proxy(args):
         print(c(f"  ✓ {name} → default: NO PROXY (real IP)",C.Y)); return
     if len(args) > 1 and str(args[1]).isdigit():
         port = int(args[1])
+    elif len(args) > 1 and str(args[1]).lower() not in ("none","noproxy","off","-"):
+        # remote proxy URL given directly, e.g. /proxy name http://user:pass@host:port
+        # or path to a .url file
+        raw = str(args[1])
+        if not re.match(r"^(https?|socks5)://", raw):
+            f = pathlib.Path(raw).expanduser()
+            raw = next((l.strip() for l in f.read_text().splitlines()
+                        if l.strip() and not l.startswith("#")), "") if f.exists() else ""
+            if not raw: print(c("  no proxy URL found in file", C.RE)); return
+        m["proxy_url"] = raw; save(ROOT/name, m)
+        sch, ui, hp = _split_url(raw)
+        print(c(f"  ✓ {name} → {_mask_url(raw)}", C.G) +
+              ("" if _url_alive(sch, ui, hp) else c("  [proxy DOWN?]", C.RE)))
+        return
     else:
         items = proxy_choices()
-        port = _ask(questionary.select(f"Proxy for {name}:",
+        sel = _ask(questionary.select(f"Proxy for {name}:",
                     choices=[questionary.Choice(l, v) for l,v in items]))
+    # normalize the two kinds of selection
+    if isinstance(sel, str) and re.match(r"^(https?|socks5)://", sel):
+        m["proxy_url"] = sel; save(ROOT/name, m)
+        sch, ui, hp = _split_url(sel)
+        print(c(f"  ✓ {name} → {_mask_url(sel)}", C.G) +
+              ("" if _url_alive(sch, ui, hp) else c("  [proxy DOWN?]", C.RE)))
+        return
+    port = sel
     if port == "__none__" or port is None:
         if port is None:
             print(c("  dibatalkan",C.Y)); return
@@ -279,26 +345,48 @@ def act_run(args):
     bg = "--bg" in rest
     # --- fast path (non-interactive) ---
     digits = [a for a in rest if str(a).isdigit()]
+    urlargs = [a for a in rest if re.match(r"^(https?|socks5)://", str(a)) or
+               (pathlib.Path(str(a)).expanduser().exists() and
+                str(a).endswith((".url",".txt",".conf")) and
+                any(l.strip().startswith(("http://","https://","socks5://"))
+                    for l in pathlib.Path(str(a)).expanduser().read_text().splitlines()))]
     forced_none = any(str(a).lower() in ("none","noproxy","off") for a in rest)
     if forced_none:
-        m["proxy_port"] = "__none__"; save(ROOT/name, m)
+        m["proxy_port"] = "__none__"; m.pop("proxy_url", None); save(ROOT/name, m)
         return _launch(name, m, None, bg)
+    if urlargs:
+        raw = str(urlargs[0])
+        if not re.match(r"^(https?|socks5)://", raw):
+            raw = next((l.strip() for l in pathlib.Path(raw).expanduser().read_text().splitlines()
+                        if l.strip().startswith(("http://","https://","socks5://"))), "")
+        if raw:
+            m["proxy_url"] = raw; save(ROOT/name, m)
+            return _launch(name, m, raw, bg)
     if digits:
         port = int(digits[0])
         m["proxy_port"] = port; save(ROOT/name, m)
         return _launch(name, m, port, bg)
+    if not rest and m.get("proxy_url"):
+        # stored remote default
+        return _launch(name, m, m["proxy_url"], bg)
 
     # --- interactive: ALWAYS ask, with the saved default at the top ---
-    saved = m.get("proxy_port")
+    saved_port = m.get("proxy_port")
+    saved_url = m.get("proxy_url")
     items = []
-    if saved is not None:
-        items.append((f"* use this profile's DEFAULT  ->  {_ptext(saved, full=True)}", "DEFAULT"))
+    if saved_url:
+        items.append((f"* use this profile's DEFAULT  ->  {_mask_url(saved_url)}", "DEFAULT"))
+    elif saved_port is not None:
+        items.append((f"* use this profile's DEFAULT  ->  {_ptext(saved_port, full=True)}", "DEFAULT"))
     for lab, val in proxy_choices(include_none=True):
         items.append((lab, val))
     # Non-TTY (script/pipe): use the saved default without a menu
     if not sys.stdin.isatty():
-        port = None if (saved is None or saved == "__none__") else saved
-        print(c(f"  (non-interactive: using {_ptext(saved, full=True)})", C.D))
+        if saved_url:
+            print(c(f"  (non-interactive: using {_mask_url(saved_url)})", C.D))
+            return _launch(name, m, saved_url, bg)
+        port = None if (saved_port is None or saved_port == "__none__") else saved_port
+        print(c(f"  (non-interactive: using {_ptext(saved_port, full=True)})", C.D))
         return _launch(name, m, port, bg)
 
     sel = _ask(questionary.select(f"Proxy for {name}:",
@@ -306,10 +394,15 @@ def act_run(args):
     if sel is None: print(c("  dibatalkan",C.Y)); return
 
     if sel == "DEFAULT":
-        port = None if saved == "__none__" else saved
+        if saved_url:
+            return _launch(name, m, saved_url, bg)
+        port = None if saved_port == "__none__" else saved_port
     elif sel == "__none__":
         port = None
         m["proxy_port"] = "__none__"; save(ROOT/name, m)
+    elif isinstance(sel, str) and re.match(r"^(https?|socks5)://", sel):
+        m["proxy_url"] = sel; save(ROOT/name, m)
+        return _launch(name, m, sel, bg)
     else:
         port = sel
         m["proxy_port"] = int(port); save(ROOT/name, m)
@@ -324,26 +417,32 @@ def _ptext(v, full=False):
 
 
 def _launch(name, m, port, bg):
-    """Launch cfox, with or without a proxy."""
+    """Launch cfox, with or without a proxy. `port` may be an int (local
+    wireproxy port) or a proxy URL string (remote HTTP/SOCKS5)."""
     nv=m["preset"].get("navigator",{}); sc=m["preset"].get("screen",{})
     dim=f"{sc.get('width')}x{sc.get('height')}  {nv.get('hardwareConcurrency')}c"
     if port is None:
         print(c(f"  ▶ {name}", C.Y) + f"  {m['os']} {m['preset_id']}  {dim}  → "
               + c("NO PROXY (real IP!)", C.RE))
-        cmd = [sys.executable, str(CFOX), name]
+        cmd = [sys.executable, str(CFOX), name]; _env = {**_os.environ, "CFM_LAUNCHED": "1"}
+    elif isinstance(port, str) and re.match(r"^(https?|socks5)://", port):
+        # remote proxy URL — cfox handles storage & geoip
+        print(c(f"  ▶ {name}", C.G) + f"  {m['os']} {m['preset_id']}  {dim}  "
+              f"→ {_mask_url(port)} (remote)")
+        cmd = [sys.executable, str(CFOX), name, "--proxy", port]; _env = {**_os.environ, "CFM_LAUNCHED": "1"}
     else:
         if not port_open(port):
             print(c(f"  port {port} is DOWN - run: ss-up", C.RE)); return
         print(c(f"  ▶ {name}", C.G) + f"  {m['os']} {m['preset_id']}  {dim}  "
               f"→ {port} ({label_for(int(port))})")
-        cmd = [sys.executable, str(CFOX), name, "--port", str(port)]
+        cmd = [sys.executable, str(CFOX), name, "--port", str(port)]; _env = {**_os.environ, "CFM_LAUNCHED": "1"}
     if bg:
-        subprocess.Popen(["setsid","bash","-c",f"{' '.join(cmd)} >> /tmp/cfm-{name}.log 2>&1"],
+        subprocess.Popen(["setsid","bash","-c",f"{' '.join(cmd)} >> /tmp/cfm-{name}.log 2>&1"], env=_env,
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
         print(c(f"    background - log: /tmp/cfm-{name}.log", C.D))
     else:
-        subprocess.run(cmd)
+        subprocess.run(cmd, env=_env)
 
 
 def act_newfp(args):

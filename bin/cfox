@@ -7,19 +7,23 @@ The fingerprint is picked once at profile creation, saved, then reused on every
 run. Each profile gets a different, consistent hardware/GPU/screen/UA.
 
   cfox acc1 --port 1091              # create or reuse profile acc1
+  cfox acc1 --proxy http://user:pass@host:port   # remote proxy (HTTP/SOCKS5)
+  cfox acc1 --proxy-file ~/proxy.txt            # proxy URL from a file (no history leak)
   cfox acc1 --new                    # regenerate the profile fingerprint
   cfox acc1 --show                   # print the stored identity
   cfox --list                        # list all profiles
 """
-import argparse, json, os as _os, pathlib, sys, secrets, random
+import argparse, json, os as _os, pathlib, sys, secrets, random, re
 
 # --- Keep the Camoufox install OUT of ~/.cache -------------------------------
 # That path is treated as disposable, and a routine 'rm -rf ~/.cache/*' removes
 # the ~1.3 GB browser install. Default: ~/.local/share/camoufox
-if not _os.environ.get("XDG_CACHE_HOME"):
+# Always point XDG_CACHE_HOME at the durable install dir so that
+# platformdirs.user_cache_dir('camoufox') resolves to CAMO_HOME/camoufox.
+# (Only CAMOUFOX_HOME can override this.)
+if not _os.environ.get("CAMOUFOX_HOME"):
     _os.environ["XDG_CACHE_HOME"] = str(
-        pathlib.Path(_os.environ.get("CAMOUFOX_HOME",
-                                     pathlib.Path.home() / ".local" / "share" / "camoufox"))
+        pathlib.Path(_os.environ["HOME"]) / ".local" / "share" / "camoufox"
     )
 
 # Make sure DISPLAY is set (required for headful mode).
@@ -136,8 +140,13 @@ def window_geometry(os_name, preset, want_w, want_h, headless=False):
     }
 
 
-def pick_preset(os_name: str) -> dict:
-    """Pick a random VALID preset, preferring ones not used by other profiles."""
+def pick_preset(os_name: str, min_screen=(1600, 900)) -> dict:
+    """Pick a random VALID preset, preferring ones not used by other profiles.
+
+    Prefers presets whose screen is at least min_screen so the browser
+    viewport fills the window nicely on modern monitors (small presets like
+    1184x666 render a tiny page inside a big window). Presets are still
+    real-device fingerprints; only the size class is preferred."""
     pres = load_presets().get("presets", {})
     pool = pres.get(os_name) or pres.get("windows")
     good = valid_indices(os_name) or list(range(len(pool)))
@@ -148,7 +157,11 @@ def pick_preset(os_name: str) -> dict:
         except Exception: pass
 
     avail = [i for i in good if f"{os_name}:{i}" not in used] or good
-    i = random.choice(avail)
+    # prefer big-screen presets (viewport fills the window on modern displays)
+    big = [i for i in avail
+           if (pool[i].get("screen", {}).get("width", 0) >= min_screen[0]
+               and pool[i].get("screen", {}).get("height", 0) >= min_screen[1])]
+    i = random.choice(big or avail)
     return {"preset_id": f"{os_name}:{i}", "preset": pool[i]}
 
 
@@ -171,14 +184,67 @@ def list_profiles():
     print(f"\ntotal: {len(rows)} profiles")
 
 
+# ---------------- proxy helpers ----------------
+def split_proxy(url):
+    """'http://user:pass@host:port' -> ('http', 'user:pass', 'host:port').
+    Accepts URLs with or without a scheme (defaults to http)."""
+    url = url.strip()
+    m = re.match(r"^(https?|socks5)://(.*)$", url, re.I)
+    scheme = m.group(1).lower() if m else "http"
+    rest = m.group(2) if m else url
+    if "@" in rest:
+        userinfo, _, hostport = rest.rpartition("@")
+    else:
+        userinfo, hostport = "", rest
+    return scheme, userinfo, hostport
+
+
+def resolve_proxy(a, meta):
+    """Decide the effective proxy for this run.
+    Priority: --proxy-file > --proxy > --port > stored proxy_url > stored port.
+    --noproxy forces no proxy."""
+    if a.noproxy:
+        return None
+    if a.proxy_file:
+        f = pathlib.Path(a.proxy_file).expanduser()
+        if not f.exists():
+            sys.exit(f"proxy file not found: {f}")
+        for line in f.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return line
+        sys.exit(f"no proxy URL found in {f}")
+    if a.proxy:
+        return a.proxy
+    if a.port:
+        return None  # --port handled separately (local wireproxy)
+    # fall back to whatever is stored in the profile
+    if meta.get("proxy_url"):
+        return meta["proxy_url"]
+    return None
+
+
+def _mask_proxy(url):
+    """Hide the password when printing: user:***@host:port"""
+    scheme, userinfo, hostport = split_proxy(url)
+    if userinfo and ":" in userinfo:
+        user = userinfo.split(":", 1)[0]
+        return f"{scheme}://{user}:***@{hostport}"
+    return f"{scheme}://{hostport}" if userinfo else url
+
+
 def main():
     p = argparse.ArgumentParser(description="Camoufox multi-profile launcher")
     p.add_argument("profile", nargs="?", help="profile name")
     p.add_argument("--port", type=int, default=0, help="local SOCKS5 port")
+    p.add_argument("--proxy", default=None, help="remote proxy URL: http(s):// or socks5:// [user:pass@]host:port")
+    p.add_argument("--proxy-file", default=None, help="read the proxy URL from this file (first non-empty line)")
+    p.add_argument("--noproxy", action="store_true", help="run without any proxy (overrides stored/default)")
     p.add_argument("--os", default=None, choices=OS_LIST, help="OS (random when creating a new profile)")
     p.add_argument("--url", default="https://iphey.com")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--new", action="store_true", help="REGENERATE this profile's fingerprint")
+    p.add_argument("--gen-only", action="store_true", help="create/refresh the profile WITHOUT launching the browser (safe for batch creation)")
     p.add_argument("--show", action="store_true", help="print the stored identity")
     p.add_argument("--list", action="store_true", help="list all profiles")
     p.add_argument("--win", default=None, help="window size WxH (default 1280x800)")
@@ -215,7 +281,10 @@ def main():
     preset = meta["preset"]
     nav = preset.get("navigator", {})
 
-    if a.show:
+    # --gen-only: stop here — fingerprint (dan proxy) sudah tersimpan, tanpa launch
+    if a.gen_only:
+        print(f"[+] {a.profile}  os={os_name}  preset={meta.get('preset_id')}  {'NEW' if is_new else 'stored'}  (gen-only, no launch)")
+        return
         print(f"profile  : {a.profile}")
         print(f"os       : {os_name}")
         print(f"preset   : {meta.get('preset_id')}")
@@ -223,17 +292,32 @@ def main():
         print(f"platform : {nav.get('platform')}  cores={nav.get('hardwareConcurrency')}")
         print(f"screen   : {preset.get('screen',{}).get('width')}x{preset.get('screen',{}).get('height')}")
         print(f"webgl    : {json.dumps(preset.get('webgl',{}), default=str)[:140]}")
+        if meta.get("proxy_url"):
+            pu = _mask_proxy(meta["proxy_url"])
+            print(f"proxy    : {pu}  (stored)")
+        elif meta.get("proxy_port"):
+            print(f"proxy    : 127.0.0.1:{meta['proxy_port']}  (stored, wireproxy)")
+        else:
+            print("proxy    : NONE")
         print(f"created  : {meta.get('created', '(older)')}")
         return
 
-    if a.port:
-        meta["proxy_port"] = a.port
+    proxy = resolve_proxy(a, meta)
+    if proxy:
+        meta["proxy_url"] = proxy
         fpath.write_text(json.dumps(meta, indent=1))
+    elif a.noproxy:
+        meta.pop("proxy_url", None)
+        meta.pop("proxy_port", None)
+        fpath.write_text(json.dumps(meta, indent=1))
+
+    ptxt = (_mask_proxy(proxy) if proxy else
+            (f"127.0.0.1:{a.port}" if a.port else "NONE (real IP!)"))
 
     print(f"[+] {a.profile}  os={os_name}  preset={meta.get('preset_id')}  {'NEW' if is_new else 'stored'}")
     print(f"    UA      : {nav.get('userAgent','')[:70]}")
     print(f"    cores   : {nav.get('hardwareConcurrency')}   screen: {preset.get('screen',{}).get('width')}x{preset.get('screen',{}).get('height')}")
-    print(f"    proxy   : {'127.0.0.1:'+str(a.port) if a.port else 'NONE (real IP!)'}")
+    print(f"    proxy   : {ptxt}")
 
     # Firefox preferences. Session restore stays off on purpose: cookies, logins
     # and history persist regardless, and a corrupt recovery file used to hang
@@ -249,7 +333,17 @@ def main():
         "toolkit.legacyUserProfileCustomizations.stylesheets": True,
     }
 
-    win_w, win_h = 1280, 800
+    # Default window size = 92% of the REAL monitor (fills the floating rule),
+    # instead of a hardcoded 1280x800 which leaves a tiny page in a big window.
+    win_w, win_h = 1766, 993
+    try:
+        from camoufox.utils import get_screen_cons as _gsc
+        _d = _gsc(False)
+        if _d and _d.max_width and _d.max_height:
+            win_w = int(_d.max_width * 0.92)
+            win_h = int(_d.max_height * 0.92)
+    except Exception:
+        pass
     if a.win and "x" in a.win:
         try:
             win_w, win_h = (int(x) for x in a.win.lower().split("x")[:2])
@@ -280,8 +374,14 @@ def main():
         i_know_what_im_doing=True,
         firefox_user_prefs=ff_prefs,
     )
-    if a.port:
-        kw["proxy"] = {"server": f"socks5://127.0.0.1:{a.port}", "username": "", "password": ""}
+    proxy = resolve_proxy(a, meta)
+    if proxy:
+        scheme, userinfo, hostport = split_proxy(proxy)
+        kw["proxy"] = {"server": f"{scheme}://{hostport}"}
+        if userinfo:
+            u, _, p = userinfo.partition(":")
+            kw["proxy"]["username"] = u
+            kw["proxy"]["password"] = p
         kw["geoip"] = True
 
     with Camoufox(**kw) as ctx:
@@ -289,11 +389,23 @@ def main():
         # a second one.
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-        # Automatic fullscreen on the landscape monitor, so profiles don't get
-        # lost across displays. Runs as a thread because the browser window
-        # appears ~1s after the context is ready. Headful + DISPLAY only.
-        # Disable with --no-fs.
-        if not a.headless and not a.no_fs and _os.environ.get("DISPLAY"):
+        # Hyprland/Wayland: pindahkan window ini ke workspace kosong terpisah
+        # (mis. 'cfx:<profile>') supaya tidak ikut di-tile dan viewport-nya
+        # tetap sesuai preset. Jalanin sekali per launch, gak blocking.
+        if not a.headless and _os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            import threading, subprocess as _sp
+            def _own_ws():
+                try:
+                    # socat-free: pakai hyprctl; gagal diam-diam kalau wrapper beda
+                    _sp.run(["hyprctl", "dispatch", "movetoworkspacesilent",
+                             f"cfx:{a.profile}"],
+                            timeout=5, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                except Exception:
+                    pass
+            threading.Thread(target=_own_ws, daemon=True).start()
+
+        # X11 fallback fullscreen (KWin/X11) — skip di Wayland
+        if not a.headless and not a.no_fs and _os.environ.get("DISPLAY") and not _os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
             import threading, subprocess as _sp
             _fs = pathlib.Path.home() / ".local" / "bin" / "cfox-fullscreen.py"
             if _fs.exists():
@@ -306,19 +418,35 @@ def main():
                 threading.Thread(target=_mkfull, daemon=True).start()
 
         # Unless restoring a session, force the initial URL.
-        if a.url and (a.url != "https://iphey.com" or not page.url or page.url == "about:blank"):
-            page.goto(a.url)
+        # goto dibungkus retry: jangan sampai timeout navigation mematikan
+        # browser dan merusak sesi yang lagi dipakai.
+        def _goto(url, tries=3):
+            for attempt in range(1, tries + 1):
+                try:
+                    page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                    return
+                except Exception as exc:
+                    if attempt == tries:
+                        print(f"[!] goto gagal setelah {tries}x ({exc.__class__.__name__}) — "
+                              f"browser tetap terbuka, muat halaman manual")
+                        return
+                    print(f"[!] goto retry {attempt}/{tries}: {exc.__class__.__name__}")
+                    try: page.wait_for_timeout(2000)
+                    except Exception: return
+
+        if a.url and a.url != "about:blank" and (a.url != "https://iphey.com" or not page.url or page.url == "about:blank"):
+            _goto(a.url)
         else:
             try:
                 if not page.url or page.url in ("about:blank", ""):
-                    page.goto(a.url)
+                    _goto(a.url)
             except Exception:
                 pass
 
         if a.headless:
             return
 
-        if sys.stdin.isatty():
+        if sys.stdin.isatty() and not _os.environ.get("CFM_LAUNCHED"):
             try: input("    [ENTER to close] ")
             except (EOFError, KeyboardInterrupt): pass
         else:
