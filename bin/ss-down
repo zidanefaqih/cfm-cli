@@ -1,2 +1,14 @@
 #!/bin/bash
-pkill -f "wireproxy -c" 2>/dev/null && echo -e "\e[33m[*] All wireproxy processes stopped\e[0m" || echo -e "\e[90m[-] No wireproxy process was running\e[0m"
+# Stop every wireproxy. systemd-managed instances are stopped through systemd
+# first, so their units do not stay "active" or get restarted; then anything
+# started by ss-up is killed.
+RUNNING=$(pgrep -fc "wireproxy -c" 2>/dev/null || true)
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user stop 'wireproxy@*.service' surfshark-proxy.service 2>/dev/null
+fi
+pkill -f "wireproxy -c" 2>/dev/null
+if [ "${RUNNING:-0}" -gt 0 ]; then
+    echo -e "\e[33m[*] All wireproxy processes stopped ($RUNNING)\e[0m"
+else
+    echo -e "\e[90m[-] No wireproxy process was running\e[0m"
+fi

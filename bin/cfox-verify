@@ -1,6 +1,11 @@
-import os, json, time, shutil, sys
+#!/usr/bin/env python3
+"""Open each profile briefly and check window/screen geometry invariants.
+
+    cfox-verify acc1 acc2 ...
+"""
+import os, json, re, time, shutil, sys
 os.environ.setdefault('XDG_CACHE_HOME', os.environ.get('CAMOUFOX_HOME', str(os.path.expanduser('~/.local/share/camoufox'))))
-os.environ['DISPLAY'] = ':1'
+os.environ.setdefault('DISPLAY', ':1')
 from camoufox.sync_api import Camoufox
 
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cfox')).read()
@@ -15,6 +20,8 @@ JS = ("()=>({sw:screen.width,sh:screen.height,aw:screen.availWidth,ah:screen.ava
 print(f"  {'PROFILE':<7}{'screen':<12}{'avail':<12}{'outer':<12}{'inner':<12}check")
 allok = True
 for name in sys.argv[1:]:
+    if not re.match(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$', name) or '..' in name:
+        print(f'  {name}: invalid profile name, skipped'); allok = False; continue
     m = json.load(open(os.path.expanduser(f'~/camfox-profiles/{name}/fingerprint.json')))
     cfg = wg(m['os'], m['preset'], 1280, 800, headless=False)
     tmp = f'/tmp/fc-{name}'

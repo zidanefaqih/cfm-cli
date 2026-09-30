@@ -6,10 +6,12 @@ Camoufox multi-profile launcher.
 The fingerprint is picked once at profile creation, saved, then reused on every
 run. Each profile gets a different, consistent hardware/GPU/screen/UA.
 
-  cfox acc1 --port 1091              # create or reuse profile acc1
+  cfox acc1                          # run with the profile's saved proxy
+  cfox acc1 --port 1091              # create or reuse profile acc1, save port 1091
+  cfox acc1 --noproxy                # run without a proxy (real IP), save that
   cfox acc1 --proxy http://user:pass@host:port   # remote proxy (HTTP/SOCKS5)
   cfox acc1 --proxy-file ~/proxy.txt            # proxy URL from a file (no history leak)
-  cfox acc1 --new                    # regenerate the profile fingerprint
+  cfox acc1 --new                    # regenerate the fingerprint (proxy kept)
   cfox acc1 --show                   # print the stored identity
   cfox --list                        # list all profiles
 """
@@ -21,10 +23,9 @@ import argparse, json, os as _os, pathlib, sys, secrets, random, re
 # Always point XDG_CACHE_HOME at the durable install dir so that
 # platformdirs.user_cache_dir('camoufox') resolves to CAMO_HOME/camoufox.
 # (Only CAMOUFOX_HOME can override this.)
-if not _os.environ.get("CAMOUFOX_HOME"):
-    _os.environ["XDG_CACHE_HOME"] = str(
-        pathlib.Path(_os.environ["HOME"]) / ".local" / "share" / "camoufox"
-    )
+_os.environ["XDG_CACHE_HOME"] = str(pathlib.Path(
+    _os.environ.get("CAMOUFOX_HOME")
+    or pathlib.Path.home() / ".local" / "share" / "camoufox"))
 
 # Make sure DISPLAY is set (required for headful mode).
 if not _os.environ.get("DISPLAY"):
@@ -59,6 +60,21 @@ def camo_ready():
     if not b.exists():
         return False, f"binary missing: {b}"
     return True, str(b)
+
+
+# Profile names become directory names and appear in process cmdlines, so keep
+# them to a safe charset (no '/', '..', spaces or shell metacharacters).
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def valid_name(name) -> bool:
+    return bool(name) and bool(NAME_RE.match(name)) and ".." not in name
+
+
+def saved_port(meta):
+    """The profile's saved local proxy port, or None (unset / '__none__')."""
+    p = meta.get("proxy_port")
+    return int(p) if isinstance(p, int) or (isinstance(p, str) and p.isdigit()) else None
 
 
 OSMAP = {"windows": "win", "macos": "mac", "linux": "lin"}
@@ -200,9 +216,9 @@ def split_proxy(url):
 
 
 def resolve_proxy(a, meta):
-    """Decide the effective proxy for this run.
-    Priority: --proxy-file > --proxy > --port > stored proxy_url > stored port.
-    --noproxy forces no proxy."""
+    """Decide the effective proxy URL for this run (None = no proxy).
+    Priority: --noproxy > --proxy-file > --proxy > --port > stored proxy_url
+    > stored proxy_port. A local port becomes socks5://127.0.0.1:<port>."""
     if a.noproxy:
         return None
     if a.proxy_file:
@@ -217,11 +233,26 @@ def resolve_proxy(a, meta):
     if a.proxy:
         return a.proxy
     if a.port:
-        return None  # --port handled separately (local wireproxy)
+        return f"socks5://127.0.0.1:{a.port}"
     # fall back to whatever is stored in the profile
     if meta.get("proxy_url"):
         return meta["proxy_url"]
-    return None
+    port = saved_port(meta)
+    return f"socks5://127.0.0.1:{port}" if port else None
+
+
+def store_proxy(a, meta):
+    """Persist an explicit proxy choice as the profile default. Returns True
+    when meta changed. Only one of proxy_url / proxy_port stays active."""
+    if a.noproxy:
+        meta.pop("proxy_url", None); meta["proxy_port"] = "__none__"
+    elif a.proxy or a.proxy_file:
+        meta["proxy_url"] = resolve_proxy(a, meta); meta.pop("proxy_port", None)
+    elif a.port:
+        meta["proxy_port"] = a.port; meta.pop("proxy_url", None)
+    else:
+        return False
+    return True
 
 
 def _mask_proxy(url):
@@ -236,10 +267,12 @@ def _mask_proxy(url):
 def main():
     p = argparse.ArgumentParser(description="Camoufox multi-profile launcher")
     p.add_argument("profile", nargs="?", help="profile name")
-    p.add_argument("--port", type=int, default=0, help="local SOCKS5 port")
+    p.add_argument("--port", type=int, default=0,
+                   help="local SOCKS5 port (saved as default; omitted = saved default)")
     p.add_argument("--proxy", default=None, help="remote proxy URL: http(s):// or socks5:// [user:pass@]host:port")
     p.add_argument("--proxy-file", default=None, help="read the proxy URL from this file (first non-empty line)")
-    p.add_argument("--noproxy", action="store_true", help="run without any proxy (overrides stored/default)")
+    p.add_argument("--noproxy", action="store_true",
+                   help="run WITHOUT a proxy (real IP) and save that as the default")
     p.add_argument("--os", default=None, choices=OS_LIST, help="OS (random when creating a new profile)")
     p.add_argument("--url", default="https://iphey.com")
     p.add_argument("--headless", action="store_true")
@@ -256,6 +289,10 @@ def main():
         list_profiles(); return
     if not a.profile:
         p.error("a profile name is required (or use --list)")
+    if not valid_name(a.profile):
+        p.error(f"invalid profile name {a.profile!r} (allowed: letters, digits, . _ -)")
+    if sum(bool(x) for x in (a.port, a.proxy, a.proxy_file, a.noproxy)) > 1:
+        p.error("use only one of --port / --proxy / --proxy-file / --noproxy")
 
     # guard: make sure the Camoufox binary is present
     ok, info = camo_ready()
@@ -270,9 +307,14 @@ def main():
 
     is_new = a.new or not fpath.exists()
     if is_new:
+        old = json.loads(fpath.read_text()) if fpath.exists() else {}
         os_name = a.os or random.choice(OS_LIST)
         data = pick_preset(os_name)
         meta = {"profile": a.profile, "os": os_name, **data}
+        # --new regenerates the fingerprint only; keep the saved proxy default.
+        for k in ("proxy_port", "proxy_url"):
+            if k in old:
+                meta[k] = old[k]
         fpath.write_text(json.dumps(meta, indent=1))
     else:
         meta = json.loads(fpath.read_text())
@@ -281,10 +323,16 @@ def main():
     preset = meta["preset"]
     nav = preset.get("navigator", {})
 
-    # --gen-only: stop here — fingerprint (dan proxy) sudah tersimpan, tanpa launch
+    # Explicit --port/--proxy/--proxy-file/--noproxy become the saved default.
+    if store_proxy(a, meta):
+        fpath.write_text(json.dumps(meta, indent=1))
+
+    # --gen-only: stop here - fingerprint (and proxy) are saved, no launch
     if a.gen_only:
         print(f"[+] {a.profile}  os={os_name}  preset={meta.get('preset_id')}  {'NEW' if is_new else 'stored'}  (gen-only, no launch)")
         return
+
+    if a.show:
         print(f"profile  : {a.profile}")
         print(f"os       : {os_name}")
         print(f"preset   : {meta.get('preset_id')}")
@@ -295,7 +343,7 @@ def main():
         if meta.get("proxy_url"):
             pu = _mask_proxy(meta["proxy_url"])
             print(f"proxy    : {pu}  (stored)")
-        elif meta.get("proxy_port"):
+        elif saved_port(meta):
             print(f"proxy    : 127.0.0.1:{meta['proxy_port']}  (stored, wireproxy)")
         else:
             print("proxy    : NONE")
@@ -303,16 +351,7 @@ def main():
         return
 
     proxy = resolve_proxy(a, meta)
-    if proxy:
-        meta["proxy_url"] = proxy
-        fpath.write_text(json.dumps(meta, indent=1))
-    elif a.noproxy:
-        meta.pop("proxy_url", None)
-        meta.pop("proxy_port", None)
-        fpath.write_text(json.dumps(meta, indent=1))
-
-    ptxt = (_mask_proxy(proxy) if proxy else
-            (f"127.0.0.1:{a.port}" if a.port else "NONE (real IP!)"))
+    ptxt = _mask_proxy(proxy) if proxy else "NONE (real IP!)"
 
     print(f"[+] {a.profile}  os={os_name}  preset={meta.get('preset_id')}  {'NEW' if is_new else 'stored'}")
     print(f"    UA      : {nav.get('userAgent','')[:70]}")
@@ -374,7 +413,6 @@ def main():
         i_know_what_im_doing=True,
         firefox_user_prefs=ff_prefs,
     )
-    proxy = resolve_proxy(a, meta)
     if proxy:
         scheme, userinfo, hostport = split_proxy(proxy)
         kw["proxy"] = {"server": f"{scheme}://{hostport}"}
@@ -389,14 +427,14 @@ def main():
         # a second one.
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-        # Hyprland/Wayland: pindahkan window ini ke workspace kosong terpisah
-        # (mis. 'cfx:<profile>') supaya tidak ikut di-tile dan viewport-nya
-        # tetap sesuai preset. Jalanin sekali per launch, gak blocking.
+        # Hyprland/Wayland: move this window to its own empty workspace
+        # (e.g. 'cfx:<profile>') so it is not tiled and the viewport keeps the
+        # preset size. Runs once per launch, non-blocking.
         if not a.headless and _os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
             import threading, subprocess as _sp
             def _own_ws():
                 try:
-                    # socat-free: pakai hyprctl; gagal diam-diam kalau wrapper beda
+                    # socat-free: uses hyprctl; fails silently otherwise
                     _sp.run(["hyprctl", "dispatch", "movetoworkspacesilent",
                              f"cfx:{a.profile}"],
                             timeout=5, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
@@ -404,7 +442,7 @@ def main():
                     pass
             threading.Thread(target=_own_ws, daemon=True).start()
 
-        # X11 fallback fullscreen (KWin/X11) — skip di Wayland
+        # X11 fallback fullscreen (KWin/X11) - skipped on Hyprland
         if not a.headless and not a.no_fs and _os.environ.get("DISPLAY") and not _os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
             import threading, subprocess as _sp
             _fs = pathlib.Path.home() / ".local" / "bin" / "cfox-fullscreen.py"
@@ -418,8 +456,8 @@ def main():
                 threading.Thread(target=_mkfull, daemon=True).start()
 
         # Unless restoring a session, force the initial URL.
-        # goto dibungkus retry: jangan sampai timeout navigation mematikan
-        # browser dan merusak sesi yang lagi dipakai.
+        # goto is retried: a navigation timeout must not kill the browser and
+        # the session in use.
         def _goto(url, tries=3):
             for attempt in range(1, tries + 1):
                 try:
@@ -427,8 +465,8 @@ def main():
                     return
                 except Exception as exc:
                     if attempt == tries:
-                        print(f"[!] goto gagal setelah {tries}x ({exc.__class__.__name__}) — "
-                              f"browser tetap terbuka, muat halaman manual")
+                        print(f"[!] goto failed after {tries}x ({exc.__class__.__name__}) - "
+                              f"browser stays open, load the page manually")
                         return
                     print(f"[!] goto retry {attempt}/{tries}: {exc.__class__.__name__}")
                     try: page.wait_for_timeout(2000)

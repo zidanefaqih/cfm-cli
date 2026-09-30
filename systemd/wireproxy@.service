@@ -1,0 +1,20 @@
+# One unit instance per wireproxy config:
+#   wireproxy@<name>.service  ->  ~/surfshark-proxy/configs/<name>.conf
+#
+# Each proxy is supervised on its own, so a crashed tunnel is restarted without
+# touching the others. Logs go to the journal:
+#   journalctl --user -u 'wireproxy@*'
+[Unit]
+Description=wireproxy SOCKS5 proxy (%i)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=%h/surfshark-proxy/configs/%i.conf
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wireproxy -c %h/surfshark-proxy/configs/%i.conf
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -28,6 +28,22 @@ VENV    = pathlib.Path.home() / ".camoufox-venv"
 CFOX    = pathlib.Path.home() / ".local/bin/cfox"
 HOTSPOT = 1080
 
+# Profile names become directory names and appear in process cmdlines, so keep
+# them to a safe charset (no '/', '..', spaces or shell metacharacters).
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+def valid_name(name):
+    return bool(name) and bool(NAME_RE.match(name)) and ".." not in name
+def bad_name(name):
+    """Print an error and return True when the profile name is not allowed."""
+    if valid_name(name): return False
+    print(c(f"  invalid profile name {name!r} (allowed: letters, digits, . _ -)", C.RE))
+    return True
+
+def fonts_db():
+    """Camoufox's bundled font list, located via the installed package."""
+    import camoufox
+    return json.loads((pathlib.Path(camoufox.__file__).parent / "fonts.json").read_text())
+
 class C:
     R="\033[0m"; B="\033[1m"; D="\033[90m"
     G="\033[32m"; Y="\033[33m"; RE="\033[31m"; CY="\033[36m"; M="\033[35m"
@@ -214,6 +230,7 @@ def act_new(args):
         if not name: print(c("  cancelled", C.Y)); return
         name = name.strip()
         rest = args
+    if bad_name(name): return
     if (ROOT/name/"fingerprint.json").exists():
         print(c(f"  profile '{name}' already exists", C.Y)); return
 
@@ -255,7 +272,7 @@ def act_new(args):
     used = {m.get("preset_id") for _,m in profiles()}
     avail = [i for i in good if f"{os_name}:{i}" not in used] or good
     i = random.choice(avail)
-    FONTS = json.load(open(VENV/"lib/python3.12/site-packages/camoufox/fonts.json"))
+    FONTS = fonts_db()
     omap = {"windows":"win","macos":"mac","linux":"lin"}
     rng = random.Random(f"{os_name}:{i}")
     fl = FONTS[omap[os_name]]
@@ -279,14 +296,15 @@ def act_proxy(args):
     import questionary
     name = args[0] if args else _ask(questionary.select(
         "Choose a profile:", choices=[n for n,_ in profiles()]))
-    if not name: print(c("  dibatalkan",C.Y)); return
+    if not name: print(c("  cancelled",C.Y)); return
+    if bad_name(name): return
     m = load(ROOT/name)
     if not m: print(c(f"  profile '{name}' does not exist", C.RE)); return
     if len(args) > 1 and str(args[1]).lower() in ("none","noproxy","off","-"):
-        m["proxy_port"] = "__none__"; save(ROOT/name, m)
+        m["proxy_port"] = "__none__"; m.pop("proxy_url", None); save(ROOT/name, m)
         print(c(f"  ✓ {name} → default: NO PROXY (real IP)",C.Y)); return
     if len(args) > 1 and str(args[1]).isdigit():
-        port = int(args[1])
+        sel = int(args[1])
     elif len(args) > 1 and str(args[1]).lower() not in ("none","noproxy","off","-"):
         # remote proxy URL given directly, e.g. /proxy name http://user:pass@host:port
         # or path to a .url file
@@ -296,7 +314,7 @@ def act_proxy(args):
             raw = next((l.strip() for l in f.read_text().splitlines()
                         if l.strip() and not l.startswith("#")), "") if f.exists() else ""
             if not raw: print(c("  no proxy URL found in file", C.RE)); return
-        m["proxy_url"] = raw; save(ROOT/name, m)
+        m["proxy_url"] = raw; m.pop("proxy_port", None); save(ROOT/name, m)
         sch, ui, hp = _split_url(raw)
         print(c(f"  ✓ {name} → {_mask_url(raw)}", C.G) +
               ("" if _url_alive(sch, ui, hp) else c("  [proxy DOWN?]", C.RE)))
@@ -307,7 +325,7 @@ def act_proxy(args):
                     choices=[questionary.Choice(l, v) for l,v in items]))
     # normalize the two kinds of selection
     if isinstance(sel, str) and re.match(r"^(https?|socks5)://", sel):
-        m["proxy_url"] = sel; save(ROOT/name, m)
+        m["proxy_url"] = sel; m.pop("proxy_port", None); save(ROOT/name, m)
         sch, ui, hp = _split_url(sel)
         print(c(f"  ✓ {name} → {_mask_url(sel)}", C.G) +
               ("" if _url_alive(sch, ui, hp) else c("  [proxy DOWN?]", C.RE)))
@@ -315,11 +333,11 @@ def act_proxy(args):
     port = sel
     if port == "__none__" or port is None:
         if port is None:
-            print(c("  dibatalkan",C.Y)); return
+            print(c("  cancelled",C.Y)); return
     if port == "__none__":
-        m["proxy_port"] = "__none__"; save(ROOT/name, m)
+        m["proxy_port"] = "__none__"; m.pop("proxy_url", None); save(ROOT/name, m)
         print(c(f"  ✓ {name} → default: NO PROXY (real IP)",C.Y)); return
-    m["proxy_port"] = int(port); save(ROOT/name, m)
+    m["proxy_port"] = int(port); m.pop("proxy_url", None); save(ROOT/name, m)
     print(c(f"  ✓ {name} → {port}",C.G) +
           ("" if port_open(port) else c("  [port DOWN]", C.RE)) +
           c(f"  ({label_for(int(port))})", C.D))
@@ -337,8 +355,9 @@ def act_run(args):
         sel = _ask(questionary.select("Choose a profile:",
             choices=[f"{n}  ({m['os']} {m['preset_id']} → {_ptext(m.get('proxy_port'))})"
                      for n,m in rows]))
-        if sel is None: print(c("  dibatalkan",C.Y)); return
+        if sel is None: print(c("  cancelled",C.Y)); return
         name = sel.split()[0]; rest = args
+    if bad_name(name): return
     m = load(ROOT/name)
     if not m: print(c(f"  profile '{name}' does not exist", C.RE)); return
 
@@ -350,7 +369,7 @@ def act_run(args):
                 str(a).endswith((".url",".txt",".conf")) and
                 any(l.strip().startswith(("http://","https://","socks5://"))
                     for l in pathlib.Path(str(a)).expanduser().read_text().splitlines()))]
-    forced_none = any(str(a).lower() in ("none","noproxy","off") for a in rest)
+    forced_none = any(str(a).lower() in ("none","noproxy","--noproxy","off") for a in rest)
     if forced_none:
         m["proxy_port"] = "__none__"; m.pop("proxy_url", None); save(ROOT/name, m)
         return _launch(name, m, None, bg)
@@ -360,11 +379,11 @@ def act_run(args):
             raw = next((l.strip() for l in pathlib.Path(raw).expanduser().read_text().splitlines()
                         if l.strip().startswith(("http://","https://","socks5://"))), "")
         if raw:
-            m["proxy_url"] = raw; save(ROOT/name, m)
+            m["proxy_url"] = raw; m.pop("proxy_port", None); save(ROOT/name, m)
             return _launch(name, m, raw, bg)
     if digits:
         port = int(digits[0])
-        m["proxy_port"] = port; save(ROOT/name, m)
+        m["proxy_port"] = port; m.pop("proxy_url", None); save(ROOT/name, m)
         return _launch(name, m, port, bg)
     if not rest and m.get("proxy_url"):
         # stored remote default
@@ -391,7 +410,7 @@ def act_run(args):
 
     sel = _ask(questionary.select(f"Proxy for {name}:",
                 choices=[questionary.Choice(l, v) for l,v in items]))
-    if sel is None: print(c("  dibatalkan",C.Y)); return
+    if sel is None: print(c("  cancelled",C.Y)); return
 
     if sel == "DEFAULT":
         if saved_url:
@@ -399,13 +418,13 @@ def act_run(args):
         port = None if saved_port == "__none__" else saved_port
     elif sel == "__none__":
         port = None
-        m["proxy_port"] = "__none__"; save(ROOT/name, m)
+        m["proxy_port"] = "__none__"; m.pop("proxy_url", None); save(ROOT/name, m)
     elif isinstance(sel, str) and re.match(r"^(https?|socks5)://", sel):
-        m["proxy_url"] = sel; save(ROOT/name, m)
+        m["proxy_url"] = sel; m.pop("proxy_port", None); save(ROOT/name, m)
         return _launch(name, m, sel, bg)
     else:
         port = sel
-        m["proxy_port"] = int(port); save(ROOT/name, m)
+        m["proxy_port"] = int(port); m.pop("proxy_url", None); save(ROOT/name, m)
     return _launch(name, m, port, bg)
 
 
@@ -419,30 +438,47 @@ def _ptext(v, full=False):
 def _launch(name, m, port, bg):
     """Launch cfox, with or without a proxy. `port` may be an int (local
     wireproxy port) or a proxy URL string (remote HTTP/SOCKS5)."""
+    if bad_name(name): return
     nv=m["preset"].get("navigator",{}); sc=m["preset"].get("screen",{})
     dim=f"{sc.get('width')}x{sc.get('height')}  {nv.get('hardwareConcurrency')}c"
+    # cfox needs the camoufox module: prefer the venv interpreter, because
+    # sys.executable may be a system python that lacks it.
+    vpy = VENV / "bin" / "python"
+    py = str(vpy) if vpy.exists() else sys.executable
+    env = {**_os.environ, "CFM_LAUNCHED": "1"}
     if port is None:
         print(c(f"  ▶ {name}", C.Y) + f"  {m['os']} {m['preset_id']}  {dim}  → "
               + c("NO PROXY (real IP!)", C.RE))
-        cmd = [sys.executable, str(CFOX), name]; _env = {**_os.environ, "CFM_LAUNCHED": "1"}
+        # explicit --noproxy: cfox would otherwise fall back to the saved default
+        cmd = [py, str(CFOX), name, "--noproxy"]
     elif isinstance(port, str) and re.match(r"^(https?|socks5)://", port):
-        # remote proxy URL — cfox handles storage & geoip
+        # Remote proxy URL. It is already saved as the profile default, so cfox
+        # reads it from fingerprint.json - the password never appears in argv
+        # (visible to every user via ps / /proc/<pid>/cmdline).
+        if (load(ROOT/name) or {}).get("proxy_url") != port:
+            m["proxy_url"] = port; m.pop("proxy_port", None); save(ROOT/name, m)
         print(c(f"  ▶ {name}", C.G) + f"  {m['os']} {m['preset_id']}  {dim}  "
               f"→ {_mask_url(port)} (remote)")
-        cmd = [sys.executable, str(CFOX), name, "--proxy", port]; _env = {**_os.environ, "CFM_LAUNCHED": "1"}
+        cmd = [py, str(CFOX), name]
     else:
         if not port_open(port):
             print(c(f"  port {port} is DOWN - run: ss-up", C.RE)); return
         print(c(f"  ▶ {name}", C.G) + f"  {m['os']} {m['preset_id']}  {dim}  "
               f"→ {port} ({label_for(int(port))})")
-        cmd = [sys.executable, str(CFOX), name, "--port", str(port)]; _env = {**_os.environ, "CFM_LAUNCHED": "1"}
+        cmd = [py, str(CFOX), name, "--port", str(int(port))]
     if bg:
-        subprocess.Popen(["setsid","bash","-c",f"{' '.join(cmd)} >> /tmp/cfm-{name}.log 2>&1"], env=_env,
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
-        print(c(f"    background - log: /tmp/cfm-{name}.log", C.D))
+        # No shell: argv is passed as a list. The log lives in the (private)
+        # profiles dir instead of a predictable world-readable /tmp path.
+        logdir = ROOT / "_logs"
+        logdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        logf = logdir / f"{name}.log"
+        fd = _os.open(logf, _os.O_WRONLY | _os.O_CREAT | _os.O_APPEND, 0o600)
+        with _os.fdopen(fd, "ab") as log:
+            subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=log,
+                             stderr=subprocess.STDOUT, start_new_session=True)
+        print(c(f"    background - log: {logf}", C.D))
     else:
-        subprocess.run(cmd, env=_env)
+        subprocess.run(cmd, env=env)
 
 
 def act_newfp(args):
@@ -450,7 +486,8 @@ def act_newfp(args):
     import questionary
     name = args[0] if args else _ask(questionary.select("Regenerate fingerprint for profile:",
                 choices=[n for n,_ in profiles()]))
-    if not name: print(c("  dibatalkan",C.Y)); return
+    if not name: print(c("  cancelled",C.Y)); return
+    if bad_name(name): return
     pdir = ROOT/name; m = load(pdir)
     if not m: print(c(f"  profile '{name}' does not exist", C.RE)); return
     os_name = None
@@ -461,7 +498,7 @@ def act_newfp(args):
         os_name = _ask(questionary.select("New OS:",
                     choices=[questionary.Choice(f"{o} (currently: {m['os']})", o)
                              for o in ["windows","macos","linux"]]))
-        if not os_name: print(c("  dibatalkan",C.Y)); return
+        if not os_name: print(c("  cancelled",C.Y)); return
     from camoufox.fingerprints import load_presets
     pres = load_presets().get("presets", {})
     vf = ROOT/"_valid.json"
@@ -470,7 +507,7 @@ def act_newfp(args):
     used = {mm.get("preset_id") for n,mm in profiles() if n != name}
     avail = [i for i in good if f"{os_name}:{i}" not in used] or good
     i = random.choice(avail)
-    FONTS = json.load(open(VENV/"lib/python3.12/site-packages/camoufox/fonts.json"))
+    FONTS = fonts_db()
     omap = {"windows":"win","macos":"mac","linux":"lin"}
     rng = random.Random(f"{os_name}:{i}-{random.randint(0,9999)}")
     fl = FONTS[omap[os_name]]
@@ -487,7 +524,7 @@ def act_info(args):
     import questionary
     name = args[0] if args else _ask(questionary.select("Show profile detail:",
                 choices=[n for n,_ in profiles()]))
-    if not name: return
+    if not name or bad_name(name): return
     m = load(ROOT/name)
     if not m: print(c("  profile does not exist", C.RE)); return
     p=m["preset"]; nv=p.get("navigator",{}); sc=p.get("screen",{}); wg=p.get("webgl",{})
@@ -507,16 +544,17 @@ def act_rm(args):
     import questionary
     name = args[0] if args else _ask(questionary.select("Delete profile:",
                 choices=[n for n,_ in profiles()]))
-    if not name: return
+    if not name or bad_name(name): return
     d = ROOT/name
     if not (d/"fingerprint.json").exists(): print(c("  profile does not exist", C.RE)); return
     ok = _ask(questionary.confirm(f"Delete '{name}'?", default=False))
-    if not ok: print(c("  dibatalkan",C.Y)); return
+    if not ok: print(c("  cancelled",C.Y)); return
     shutil.rmtree(d); print(c(f"  {name} deleted", C.G))
 
 
 def act_newname(args):
     if len(args)<2: print(c("  usage: /newname <old> <new>", C.Y)); return
+    if bad_name(args[0]) or bad_name(args[1]): return
     a,b = ROOT/args[0], ROOT/args[1]
     if not (a/"fingerprint.json").exists(): print(c("  source profile does not exist", C.RE)); return
     if (b/"fingerprint.json").exists(): print(c("  new name is already taken", C.RE)); return
@@ -590,7 +628,7 @@ def interactive():
                     # pick the shortest candidate (usually the intended one)
                     cmd = min(cand, key=len); fn = dispatch[cmd]
                     others = [k for k in cand if k != cmd]
-                    print(c(f"  → {cmd}", C.D) + c(f"   (lainnya: {', '.join(sorted(others))})", C.D))
+                    print(c(f"  → {cmd}", C.D) + c(f"   (others: {', '.join(sorted(others))})", C.D))
         if not fn:
             print(c(f"  unknown command '{cmd}'.  /help",C.Y)); continue
         if cmd == "/quit": break
@@ -614,7 +652,9 @@ def main():
     d = {"list": lambda: show_list(),
          "proxies": lambda: show_proxies(a.test),
          "new": lambda: act_new(a.args + extra),
-         "run": lambda: act_run(a.args + (["--bg"] if a.bg else [])),
+         "run": lambda: act_run(a.args + ([str(a.port)] if a.port else [])
+                                + (["--noproxy"] if a.noproxy else [])
+                                + (["--bg"] if a.bg else [])),
          "proxy": lambda: act_proxy(a.args), "set": lambda: act_proxy(a.args),
          "info": lambda: act_info(a.args), "newfp": lambda: act_newfp(a.args + extra),
          "rm": lambda: act_rm(a.args), "newname": lambda: act_newname(a.args)}

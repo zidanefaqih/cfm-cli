@@ -8,16 +8,18 @@ window can be forced fullscreen on one specific monitor.
 Argument: <profile-name>   (located via the camoufox-bin process cmdline)
 Uses the system python because the Camoufox venv has no python-xlib.
 """
-import sys, time, subprocess, os
+import sys, time, subprocess, os, re
 
 DISPLAY = os.environ.get("DISPLAY", ":1")
 # Landscape monitor (from `xrandr`): HDMI-0 1920x1080 at +0+650, x=0 -> monitor #0.
 LANDSCAPE_MON = 0
 
 
-def _py(code, timeout=15):
+def _py(code, *args, timeout=15):
+    """Run code in the system python; values go in via argv, never into the source."""
     try:
-        r = subprocess.run(["python3", "-c", code], capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(["python3", "-c", code, *args],
+                           capture_output=True, text=True, timeout=timeout)
         return r.stdout
     except Exception:
         return ""
@@ -26,18 +28,21 @@ def _py(code, timeout=15):
 def find_window(profile):
     """Find the X11 window of the camoufox process that opened this profile."""
     code = r'''
-import os, glob
+import os, sys, glob
 from Xlib import display, X
 d = display.Display(os.environ.get("DISPLAY", ":1"))
 root = d.screen().root
-prof = "__PROFILE__"
+# Match the profile directory as a WHOLE argv element, so "acc1" does not also
+# match ".../camfox-profiles/acc10".
+suffix = "/camfox-profiles/" + sys.argv[1]
 pids = set()
 for p in glob.glob("/proc/[0-9]*/cmdline"):
     try:
-        cl = open(p, "rb").read().decode("utf8", "ignore")
+        argv = open(p, "rb").read().decode("utf8", "ignore").split("\0")
     except Exception:
         continue
-    if prof in cl and "camoufox" in cl:
+    if any("camoufox" in a for a in argv) and \
+            any(a.rstrip("/").endswith(suffix) for a in argv):
         pids.add(int(p.split("/")[2]))
 allp = set(pids)
 for p in glob.glob("/proc/[0-9]*/stat"):
@@ -62,8 +67,8 @@ def walk(w):
         except Exception: pass
 walk(root)
 for f in found: print(f[0], f[1], f[2])
-'''.replace("__PROFILE__", profile)
-    for line in _py(code).strip().split("\n"):
+'''
+    for line in _py(code, profile).strip().split("\n"):
         parts = line.split()
         if len(parts) >= 3:
             try:
@@ -102,6 +107,9 @@ def main():
         print("[fs] a profile name is required", flush=True)
         return
     profile = sys.argv[1]
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", profile) or ".." in profile:
+        print(f"[fs] invalid profile name {profile!r}", flush=True)
+        return
     wid = None
     for _ in range(60):          # up to 30 seconds
         wid = find_window(profile)

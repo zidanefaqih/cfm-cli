@@ -39,11 +39,13 @@ cp bin/* ~/.local/bin/
 chmod +x ~/.local/bin/*
 
 # 3. point the shebang at the venv (optional but recommended)
-sed -i "1s|.*|#!$HOME/.camoufox-venv/bin/python|" ~/.local/bin/cfox ~/.local/bin/cfm
+sed -i "1s|.*|#!$HOME/.camoufox-venv/bin/python|" ~/.local/bin/cfox ~/.local/bin/cfm ~/.local/bin/cfox-verify
 ```
 
-> `cfox` and `cfm` ship with `#!/usr/bin/env python3`. If you use a venv, replace
-> the shebang as in step 3 so the `camoufox` module resolves.
+> The Python scripts ship with `#!/usr/bin/env python3`. If you use a venv, replace
+> the shebang as in step 3 so the `camoufox` module resolves. `cfm` launches
+> `cfox` with `~/.camoufox-venv/bin/python` when that venv exists.
+> `cfox-fullscreen.py` runs on the system python and needs `python-xlib`.
 
 Camoufox installs to `~/.cache/camoufox` by default, **a path the system treats
 as disposable**. The scripts here deliberately relocate it to
@@ -76,14 +78,19 @@ Tab completes commands; the up/down arrows walk through history.
 ### Directly from the CLI
 
 ```bash
-cfox acc1                        # run with the profile's default proxy
-cfox acc1 --port 1091            # force a specific proxy
+cfox acc1                        # run with the profile's saved default proxy
+cfox acc1 --port 1091            # use (and save) a specific proxy
+cfox acc1 --noproxy              # run WITHOUT a proxy (real IP), saved as default
 cfox acc1 --port 1091 --headless # no window
 cfox acc1 --no-fs                # skip automatic fullscreen
 cfox --list                      # list profiles
 cfox acc1 --show                 # print the stored identity
-cfox acc1 --new                  # regenerate the fingerprint
+cfox acc1 --new                  # regenerate the fingerprint (proxy kept)
+cfm run acc1 --port 1091 --bg    # same via cfm, in the background
 ```
+
+Profile names may contain letters, digits, `.`, `_` and `-` only. Background
+logs are written to `~/camfox-profiles/_logs/<name>.log` (mode 600).
 
 ### Verify geometry
 
@@ -127,14 +134,21 @@ For plain HTTP/SOCKS proxies, edit the `kw["proxy"]` block in `cfox` instead.
 
 ## systemd (optional)
 
-To start the proxies automatically at boot:
+To start the proxies automatically at boot, use the template unit: one
+supervised instance per config, restarted on failure, logs in the journal.
 
 ```bash
-cp systemd/surfshark-proxy.service ~/.config/systemd/user/
+mkdir -p ~/.config/systemd/user
+cp systemd/wireproxy@.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now surfshark-proxy.service
+for c in ~/surfshark-proxy/configs/*.conf; do
+    systemctl --user enable --now "wireproxy@$(basename "$c" .conf).service"
+done
 loginctl enable-linger "$USER"
+journalctl --user -u 'wireproxy@*' -f     # logs
 ```
+
+`ss-down` stops these units as well as proxies started by `ss-up`.
 
 ## Important notes
 
