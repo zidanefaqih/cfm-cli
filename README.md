@@ -68,6 +68,8 @@ Commands inside the TUI:
 | `/list` | list every profile |
 | `/proxy <name>` | change a profile's default proxy |
 | `/proxies` | proxy status; `--test` also checks exit IPs |
+| `/addproxy [label]` | add a remote proxy (host, port, username, password) |
+| `/rmproxy [label]` | delete a remote proxy |
 | `/info <name>` | show UA/GPU/screen/cores detail |
 | `/newfp <name>` | regenerate the fingerprint (profile and proxy kept) |
 | `/newname <old> <new>` | rename a profile |
@@ -130,7 +132,29 @@ BindAddress = 127.0.0.1:1091
 `ss-up` starts every config, `ss-down` stops them, and `cekproxy` prints their
 status together with the exit IP location.
 
-For plain HTTP/SOCKS proxies, edit the `kw["proxy"]` block in `cfox` instead.
+### Remote proxies (Webshare and similar)
+
+Add a proxy with a username/password from the TUI:
+
+```
+cfm> /addproxy webshare-us1
+  Paste proxy (host:port:user:pass, user:pass@host:port or URL)
+  or press ENTER to fill in the fields one by one:
+```
+
+- Accepted formats: `host:port:user:pass` (Webshare's download list),
+  `user:pass@host:port`, `http://user:pass@host:port`, `host:port`.
+- The wizard tests the proxy (exit IP + location) before saving and can set it
+  as a profile's default right away. Assign it later with `/proxy <profile> <label>`.
+- Stored as `~/surfshark-proxy/configs/<label>.url` (mode 600, credentials
+  percent-encoded). Profile files that reference it are mode 600 as well.
+- Firefox cannot authenticate to SOCKS5 proxies, so use **HTTP** for
+  proxies with a username/password; the wizard offers to switch.
+- `/proxies --test` checks remote proxies too; `/rmproxy <label>` deletes one.
+- Scripted: `cfm addproxy <label> host:port:user:pass` (the password ends up in
+  your shell history).
+- `cfox` resolves the exit IP through the proxy before launching and refuses to
+  start when the proxy does not work.
 
 ## systemd (optional)
 

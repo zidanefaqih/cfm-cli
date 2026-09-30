@@ -8,6 +8,7 @@ cfm - Camoufox Manager (interactive, arrow-key menus)
     cfm> /run acc1     -> without a port, an arrow-key menu appears
 """
 import argparse, json, os as _os, pathlib, re, shutil, socket, subprocess, sys, random
+from urllib.parse import quote, unquote
 
 # Same as cfox: keep the Camoufox install outside ~/.cache so a routine
 # 'rm -rf ~/.cache/*' cannot delete it.
@@ -79,15 +80,10 @@ def proxy_choices(include_none=True):
         mark = "✓" if alive else "✗"
         items.append((f"{mark} {v['port']:>5}  {k:<18} {v['desc'][:34]}", v["port"]))
     # remote proxies: one *.url file per proxy in CONFDIR, contents = proxy URL
-    for f in sorted(PROXYURLDIR.glob("*.url")) if PROXYURLDIR.exists() else []:
-        line = next((l.strip() for l in f.read_text().splitlines()
-                     if l.strip() and not l.startswith("#")), None)
-        if not line:
-            continue
-        scheme, userinfo, hostport = _split_url(line)
-        alive = _url_alive(scheme, userinfo, hostport)
+    for label, line in remote_proxies().items():
+        alive = _url_alive(*_split_url(line))
         mark = "✓" if alive else "✗"
-        items.append((f"{mark}   ⋀   {f.stem:<18} {_mask_url(line)[:44]}", line))
+        items.append((f"{mark} remote {label:<18} {_mask_url(line)[:44]}", line))
     if include_none:
         items.append(("-  no proxy (use real IP!)", "__none__"))
     return items
@@ -106,24 +102,114 @@ def _split_url(url):
 
 def _mask_url(url):
     scheme, userinfo, hostport = _split_url(url)
-    if userinfo and ":" in userinfo:
-        return f"{scheme}://{userinfo.split(':',1)[0]}:***@{hostport}"
+    if userinfo:
+        user = unquote(userinfo.split(":", 1)[0])
+        return f"{scheme}://{user}:***@{hostport}" if ":" in userinfo else f"{scheme}://{user}@{hostport}"
     return url
 
 
-def _url_alive(scheme, userinfo, hostport, timeout=9):
+def _curl_via(scheme, userinfo, hostport, target, timeout=9):
+    """curl `target` through a remote proxy. Credentials go in via a curl
+    config on stdin, so they never appear in argv (visible in ps)."""
+    cfg = f'proxy = "{scheme}://{hostport}"\n'
+    if userinfo:
+        u, _, p = userinfo.partition(":")
+        up = f"{unquote(u)}:{unquote(p)}".replace("\\", "\\\\").replace('"', '\\"')
+        cfg += f'proxy-user = "{up}"\n'
     try:
-        pre = []
-        if userinfo:
-            u, _, p = userinfo.partition(":")
-            pre = ["-x", f"{scheme}://{u}:{p}@{hostport}"]
-        else:
-            pre = ["-x", f"{scheme}://{hostport}"]
-        r = subprocess.run(["curl","-s","-m",str(timeout),*pre,"https://ipinfo.io/ip"],
-                           capture_output=True, text=True, timeout=timeout+5)
-        return bool(r.stdout.strip())
+        r = subprocess.run(["curl", "-s", "-m", str(timeout), "-K", "-", target],
+                           input=cfg, capture_output=True, text=True, timeout=timeout + 5)
+        return r.stdout.strip()
     except Exception:
-        return False
+        return ""
+
+
+def _url_alive(scheme, userinfo, hostport, timeout=9):
+    return bool(_curl_via(scheme, userinfo, hostport, "https://api.ipify.org", timeout))
+
+
+def _url_info(url, timeout=12):
+    """Exit IP details through a remote proxy, or None."""
+    out = _curl_via(*_split_url(url),
+                    "http://ip-api.com/json/?fields=query,country,city,isp,hosting", timeout)
+    try: return json.loads(out) if out else None
+    except Exception: return None
+
+
+def remote_proxies():
+    """{label: url} from CONFDIR/*.url (first non-comment line of each file)."""
+    out = {}
+    for f in sorted(PROXYURLDIR.glob("*.url")) if PROXYURLDIR.exists() else []:
+        line = next((l.strip() for l in f.read_text().splitlines()
+                     if l.strip() and not l.strip().startswith("#")), None)
+        if line: out[f.stem] = line
+    return out
+
+
+def parse_proxy(text, default_scheme="http"):
+    """Parse the formats proxy providers hand out (e.g. Webshare):
+         host:port
+         host:port:user:pass          (Webshare "download list" format)
+         user:pass@host:port
+         http://user:pass@host:port   socks5://host:port
+    Returns dict(scheme, host, port, user, password) or raises ValueError."""
+    t = text.strip()
+    if not t: raise ValueError("empty")
+    m = re.match(r"^(https?|socks5h?)://(.*)$", t, re.I)
+    scheme = (m.group(1).lower() if m else default_scheme).replace("socks5h", "socks5")
+    rest = m.group(2).rstrip("/") if m else t
+    user = pw = ""
+    parts = rest.split(":")
+    if not m and len(parts) >= 4 and parts[1].isdigit():
+        # host:port:user:pass - checked first, the password may contain '@'
+        host, port = parts[0], parts[1]
+        user, pw = parts[2], ":".join(parts[3:])
+    elif "@" in rest:
+        ui, _, hp = rest.rpartition("@")
+        user, _, pw = ui.partition(":")
+        host, _, port = hp.rpartition(":")
+    elif len(parts) == 2:
+        host, port = parts
+    elif not m and len(parts) >= 4 and parts[-1].isdigit():   # user:pass:host:port
+        host, port = parts[-2], parts[-1]
+        user, pw = parts[0], ":".join(parts[1:-2])
+    else:
+        raise ValueError("expected host:port, host:port:user:pass or user:pass@host:port")
+    return _check_proxy(dict(scheme=scheme, host=host.strip(), port=str(port).strip(),
+                             user=unquote(user), password=unquote(pw)))
+
+
+def _check_proxy(d):
+    if d["scheme"] not in ("http", "https", "socks5"):
+        raise ValueError(f"unsupported scheme {d['scheme']!r}")
+    if not re.match(r"^[A-Za-z0-9.-]+$", d["host"] or ""):
+        raise ValueError(f"invalid host {d['host']!r}")
+    if not d["port"].isdigit() or not 0 < int(d["port"]) < 65536:
+        raise ValueError(f"invalid port {d['port']!r}")
+    if d["password"] and not d["user"]:
+        raise ValueError("password given without a username")
+    return d
+
+
+def proxy_url(d):
+    """Build the stored URL; credentials are percent-encoded so characters such
+    as @ : / # in a password cannot break parsing."""
+    auth = ""
+    if d["user"]:
+        auth = quote(d["user"], safe="")
+        if d["password"]: auth += ":" + quote(d["password"], safe="")
+        auth += "@"
+    return f"{d['scheme']}://{auth}{d['host']}:{int(d['port'])}"
+
+
+def save_remote_proxy(label, url):
+    PROXYURLDIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    f = PROXYURLDIR / f"{label}.url"
+    fd = _os.open(f, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+    with _os.fdopen(fd, "w") as fh:
+        fh.write(url + "\n")
+    _os.chmod(f, 0o600)      # also tighten a pre-existing file
+    return f
 
 def proxy_ip(port, timeout=9):
     try:
@@ -137,7 +223,12 @@ def proxy_ip(port, timeout=9):
 def load(pdir):
     f = pdir / "fingerprint.json"
     return json.loads(f.read_text()) if f.exists() else None
-def save(pdir, m): (pdir / "fingerprint.json").write_text(json.dumps(m, indent=1))
+def save(pdir, m):
+    # may contain proxy credentials (proxy_url) -> owner-only
+    f = pdir / "fingerprint.json"
+    fd = _os.open(f, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+    with _os.fdopen(fd, "w") as fh: fh.write(json.dumps(m, indent=1))
+    _os.chmod(f, 0o600)
 def profiles():
     if not ROOT.exists(): return []
     out=[]
@@ -154,14 +245,18 @@ def label_for(port, px=None):
 def show_list():
     rows = profiles()
     if not rows: print(c("  no profiles yet. type: /new", C.Y)); return
-    px = discover_proxies()
+    px = discover_proxies(); rproxies = remote_proxies()
     print()
     print(c(f"  {'PROFILE':<10}{'OS':<9}{'PRESET':<13}{'CORES':<7}{'SCREEN':<12}{'PROXY':<26}STATUS", C.B))
     print(c("  " + "-"*92, C.D))
     for name, m in rows:
         p=m["preset"]; n=p.get("navigator",{}); s=p.get("screen",{})
         port=m.get("proxy_port")
-        if port == "__none__":
+        if m.get("proxy_url"):
+            lab = next((k for k,u in rproxies.items() if u == m["proxy_url"]), None)
+            ptxt = f"remote ({lab})" if lab else _mask_url(m["proxy_url"]).split("@")[-1]
+            stat = c("remote", C.D)
+        elif port == "__none__":
             ptxt = c("NO PROXY", C.Y) + " (real IP)"
             stat = ""
         elif port:
@@ -183,14 +278,21 @@ def show_proxies(test=False):
         alive = port_open(v["port"])
         print(f"  {k:<20}{v['port']:<8}"
               f"{(c('up',C.G) if alive else c('DOWN',C.RE)):<20}{c(v['desc'],C.D)}")
+    rp = remote_proxies()
+    for k,u in rp.items():
+        print(f"  {k:<20}{'remote':<8}{c('-',C.D):<20}{c(_mask_url(u),C.D)}")
     if test:
         print(c("\n  checking exit IPs...", C.D))
-        for k,v in px.items():
-            d = proxy_ip(v["port"])
+        checks = [(k, lambda v=v: proxy_ip(v["port"])) for k,v in px.items()]
+        checks += [(k, lambda u=u: _url_info(u)) for k,u in rp.items()]
+        for k, fn in checks:
+            d = fn()
             if d:
                 flag = c(" [DC]",C.Y) if d.get("hosting") else ""
-                print(f"    {k:<20} {c(d.get('query','?')):<27}{d.get('country')}/{d.get('city')}{flag}")
+                print(f"    {k:<20} {c(d.get('query','?'),C.G):<27}{d.get('country')}/{d.get('city')}{flag}")
             else: print(f"    {k:<20} {c('failed',C.RE)}")
+    if not rp:
+        print(c("\n  add a remote proxy (e.g. Webshare) with /addproxy", C.D))
     print()
 
 def show_help():
@@ -202,6 +304,9 @@ def show_help():
   {c('/proxies',C.CY)} [--test]  list proxies; --test checks the exit IP
   {c('/run',C.CY)} [name]        run (arrow menu for profile and proxy when omitted)
   {c('/proxy',C.CY)} [name]      set the profile's default proxy (arrow menu)
+  {c('/addproxy',C.CY)} [label]  add a remote proxy: host, port, user, password
+                      (or paste host:port:user:pass / user:pass@host:port)
+  {c('/rmproxy',C.CY)} [label]   delete a remote proxy
   {c('/info',C.CY)} <name>       show UA/GPU/screen/cores detail
   {c('/newfp',C.CY)} <name>      regenerate fingerprint (profile and proxy kept)
   {c('/newname',C.CY)} <old> <new>   rename a profile
@@ -309,11 +414,18 @@ def act_proxy(args):
         # remote proxy URL given directly, e.g. /proxy name http://user:pass@host:port
         # or path to a .url file
         raw = str(args[1])
-        if not re.match(r"^(https?|socks5)://", raw):
+        if raw in remote_proxies():
+            raw = remote_proxies()[raw]            # label added with /addproxy
+        elif not re.match(r"^(https?|socks5)://", raw):
             f = pathlib.Path(raw).expanduser()
-            raw = next((l.strip() for l in f.read_text().splitlines()
-                        if l.strip() and not l.startswith("#")), "") if f.exists() else ""
-            if not raw: print(c("  no proxy URL found in file", C.RE)); return
+            if f.is_file():
+                raw = next((l.strip() for l in f.read_text().splitlines()
+                            if l.strip() and not l.startswith("#")), "")
+                if not raw: print(c("  no proxy URL found in file", C.RE)); return
+            else:
+                # provider formats: host:port:user:pass, user:pass@host:port
+                try: raw = proxy_url(parse_proxy(raw))
+                except ValueError as e: print(c(f"  {e}", C.RE)); return
         m["proxy_url"] = raw; m.pop("proxy_port", None); save(ROOT/name, m)
         sch, ui, hp = _split_url(raw)
         print(c(f"  ✓ {name} → {_mask_url(raw)}", C.G) +
@@ -562,8 +674,112 @@ def act_newname(args):
     print(c(f"  ✓ {args[0]} → {args[1]}", C.G))
 
 
+def act_addproxy(args):
+    """Add a remote proxy (Webshare etc.): paste it, or fill in the fields."""
+    import questionary
+    tty = sys.stdin.isatty()
+    # 1. label
+    label = args[0] if args else _ask(questionary.text(
+        "Label for this proxy (e.g. webshare-us1):"))
+    if not label: print(c("  cancelled", C.Y)); return
+    label = label.strip()
+    if not valid_name(label):
+        print(c(f"  invalid label {label!r} (allowed: letters, digits, . _ -)", C.RE)); return
+    if (PROXYURLDIR / f"{label}.conf").exists():
+        print(c(f"  '{label}' is already a wireproxy config", C.RE)); return
+    if label in remote_proxies() and tty:
+        if not _ask(questionary.confirm(f"'{label}' exists - overwrite?", default=False)):
+            print(c("  cancelled", C.Y)); return
+
+    # 2. the proxy itself
+    if len(args) > 1:
+        # non-interactive: cfm addproxy <label> <host:port:user:pass | URL>
+        # (note: this puts the password in your shell history)
+        try: d = parse_proxy(args[1])
+        except ValueError as e: print(c(f"  {e}", C.RE)); return
+    else:
+        if not tty: print(c("  usage: cfm addproxy <label> <proxy>", C.Y)); return
+        pasted = _ask(questionary.text(
+            "Paste proxy (host:port:user:pass, user:pass@host:port or URL)\n"
+            "  or press ENTER to fill in the fields one by one:"))
+        if pasted is None: print(c("  cancelled", C.Y)); return
+        if pasted.strip():
+            try: d = parse_proxy(pasted)
+            except ValueError as e: print(c(f"  {e}", C.RE)); return
+        else:
+            scheme = _ask(questionary.select("Type:", choices=[
+                questionary.Choice("HTTP    (recommended, works with username/password)", "http"),
+                questionary.Choice("SOCKS5  (only WITHOUT username/password)", "socks5")]))
+            if not scheme: print(c("  cancelled", C.Y)); return
+            host = _ask(questionary.text("Host / IP:", validate=lambda v:
+                        bool(re.match(r"^[A-Za-z0-9.-]+$", v.strip())) or "letters, digits, . and - only"))
+            if not host: print(c("  cancelled", C.Y)); return
+            port = _ask(questionary.text("Port:", validate=lambda v:
+                        (v.strip().isdigit() and 0 < int(v) < 65536) or "1-65535"))
+            if not port: print(c("  cancelled", C.Y)); return
+            user = _ask(questionary.text("Username (empty = none):")) or ""
+            pw = _ask(questionary.password("Password:")) if user.strip() else ""
+            try: d = _check_proxy(dict(scheme=scheme, host=host.strip(), port=port.strip(),
+                                       user=user.strip(), password=pw or ""))
+            except ValueError as e: print(c(f"  {e}", C.RE)); return
+
+    # Firefox cannot authenticate to SOCKS5 proxies (Mozilla bug 122752), so
+    # an authenticated SOCKS5 proxy would silently fail in the browser.
+    if d["scheme"] == "socks5" and d["user"]:
+        print(c("  Firefox/Camoufox cannot log in to a SOCKS5 proxy with a username/password.", C.Y))
+        print(c("  Most providers (Webshare included) accept HTTP with the same credentials.", C.D))
+        if tty and not _ask(questionary.confirm("Use HTTP instead?", default=True)):
+            print(c("  cancelled", C.Y)); return
+        d["scheme"] = "http"
+
+    url = proxy_url(d)
+    # 3. test
+    print(c(f"  testing {_mask_url(url)} ...", C.D))
+    info = _url_info(url)
+    if info:
+        flag = c(" [DC]", C.Y) if info.get("hosting") else ""
+        print(c("  ✓ works", C.G) + f"  exit IP {info.get('query')}  "
+              f"{info.get('country')}/{info.get('city')}  {str(info.get('isp',''))[:30]}{flag}")
+    else:
+        print(c("  ✗ no response through this proxy (wrong credentials/port, or IP not whitelisted?)", C.RE))
+        if tty and not _ask(questionary.confirm("Save it anyway?", default=False)):
+            print(c("  not saved", C.Y)); return
+
+    # 4. save (mode 0600: the file holds the password)
+    f = save_remote_proxy(label, url)
+    print(c(f"  ✓ saved as '{label}'", C.G) + c(f"  ({f})", C.D))
+
+    # 5. optionally make it a profile's default
+    rows = profiles()
+    if tty and rows:
+        who = _ask(questionary.select("Use it as the default proxy for a profile?",
+                   choices=[questionary.Choice("no, just save it", "")] +
+                           [questionary.Choice(f"{n}  (now: {_ptext(m.get('proxy_port')) if not m.get('proxy_url') else _mask_url(m['proxy_url'])})", n)
+                            for n, m in rows]))
+        if who:
+            m = load(ROOT/who)
+            m["proxy_url"] = url; m.pop("proxy_port", None); save(ROOT/who, m)
+            print(c(f"  ✓ {who} → {label}", C.G))
+
+
+def act_rmproxy(args):
+    import questionary
+    rp = remote_proxies()
+    if not rp: print(c("  no remote proxies", C.Y)); return
+    label = args[0] if args else _ask(questionary.select("Delete remote proxy:", choices=list(rp)))
+    if not label: print(c("  cancelled", C.Y)); return
+    if label not in rp or not valid_name(label):
+        print(c(f"  remote proxy '{label}' does not exist", C.RE)); return
+    users = [n for n, m in profiles() if m.get("proxy_url") == rp[label]]
+    if users: print(c(f"  still the default of: {', '.join(users)} (they keep their own copy)", C.Y))
+    if sys.stdin.isatty() and not _ask(questionary.confirm(f"Delete '{label}'?", default=False)):
+        print(c("  cancelled", C.Y)); return
+    (PROXYURLDIR / f"{label}.url").unlink()
+    print(c(f"  ✓ {label} deleted", C.G))
+
+
 # ---------------- TUI ----------------
-COMMANDS = ["/new","/list","/proxies","/run","/proxy","/info","/newfp","/newname","/rm","/help","/quit"]
+COMMANDS = ["/new","/list","/proxies","/run","/proxy","/addproxy","/rmproxy","/info","/newfp","/newname","/rm","/help","/quit"]
 
 def complete_names(prefix):
     try:
@@ -573,6 +789,8 @@ def complete_names(prefix):
         if p[0] in ("/run","/proxy","/info","/rm","/newfp","/newname"):
             return [" ".join(p[:-1]+[o]) for o in
                     [n for n,_ in profiles() if n.startswith(p[-1])]]
+        if p[0]=="/rmproxy":
+            return [f"/rmproxy {k}" for k in remote_proxies() if k.startswith(p[-1])]
         if p[0]=="/proxies":
             return ["/proxies","/proxies --test"]
     except Exception: pass
@@ -596,7 +814,8 @@ def interactive():
 {c('  │',C.CY)}  {c('Camoufox Manager',C.B)}   {c('· cfm',C.D)}                    {c('│',C.CY)}
 {c('  ╰────────────────────────────────────────────╯',C.CY)}
   {c('/new',C.CY)} new profile   {c('/run',C.CY)} launch      {c('/list',C.CY)} list
-  {c('/proxy',C.CY)} set proxy   {c('/proxies',C.CY)} test proxy  {c('/help',C.CY)} help
+  {c('/proxy',C.CY)} set proxy   {c('/proxies',C.CY)} test proxy  {c('/addproxy',C.CY)} add proxy
+  {c('/help',C.CY)} help
   {c('tab',C.D)}=autocomplete   {c('↑↓',C.D)}=history   {c('←→',C.D)}=menu
 """)
     dispatch = {
@@ -604,6 +823,7 @@ def interactive():
         "/proxies": lambda a: show_proxies("--test" in a),
         "/new": act_new, "/run": act_run, "/proxy": act_proxy, "/info": act_info,
         "/newfp": act_newfp, "/rm": act_rm, "/newname": act_newname,
+        "/addproxy": act_addproxy, "/rmproxy": act_rmproxy,
         "/help": lambda a: show_help(),
         "/quit": lambda a: None,
     }
@@ -657,7 +877,8 @@ def main():
                                 + (["--bg"] if a.bg else [])),
          "proxy": lambda: act_proxy(a.args), "set": lambda: act_proxy(a.args),
          "info": lambda: act_info(a.args), "newfp": lambda: act_newfp(a.args + extra),
-         "rm": lambda: act_rm(a.args), "newname": lambda: act_newname(a.args)}
+         "rm": lambda: act_rm(a.args), "newname": lambda: act_newname(a.args),
+         "addproxy": lambda: act_addproxy(a.args), "rmproxy": lambda: act_rmproxy(a.args)}
     fn = d.get(a.cmd)
     if not fn: print(f"unknown command: {a.cmd}"); show_help(); return
     fn()

@@ -16,6 +16,7 @@ run. Each profile gets a different, consistent hardware/GPU/screen/UA.
   cfox --list                        # list all profiles
 """
 import argparse, json, os as _os, pathlib, sys, secrets, random, re
+from urllib.parse import quote, unquote
 
 # --- Keep the Camoufox install OUT of ~/.cache -------------------------------
 # That path is treated as disposable, and a routine 'rm -rf ~/.cache/*' removes
@@ -69,6 +70,14 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 def valid_name(name) -> bool:
     return bool(name) and bool(NAME_RE.match(name)) and ".." not in name
+
+
+def write_meta(fpath, meta):
+    """fingerprint.json may hold proxy credentials (proxy_url) -> owner-only."""
+    fd = _os.open(fpath, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+    with _os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(meta, indent=1))
+    _os.chmod(fpath, 0o600)
 
 
 def saved_port(meta):
@@ -259,7 +268,7 @@ def _mask_proxy(url):
     """Hide the password when printing: user:***@host:port"""
     scheme, userinfo, hostport = split_proxy(url)
     if userinfo and ":" in userinfo:
-        user = userinfo.split(":", 1)[0]
+        user = unquote(userinfo.split(":", 1)[0])
         return f"{scheme}://{user}:***@{hostport}"
     return f"{scheme}://{hostport}" if userinfo else url
 
@@ -315,7 +324,7 @@ def main():
         for k in ("proxy_port", "proxy_url"):
             if k in old:
                 meta[k] = old[k]
-        fpath.write_text(json.dumps(meta, indent=1))
+        write_meta(fpath, meta)
     else:
         meta = json.loads(fpath.read_text())
         os_name = a.os or meta["os"]
@@ -325,7 +334,7 @@ def main():
 
     # Explicit --port/--proxy/--proxy-file/--noproxy become the saved default.
     if store_proxy(a, meta):
-        fpath.write_text(json.dumps(meta, indent=1))
+        write_meta(fpath, meta)
 
     # --gen-only: stop here - fingerprint (and proxy) are saved, no launch
     if a.gen_only:
@@ -416,11 +425,28 @@ def main():
     if proxy:
         scheme, userinfo, hostport = split_proxy(proxy)
         kw["proxy"] = {"server": f"{scheme}://{hostport}"}
+        enc = f"{scheme}://{hostport}"
+        hide = []        # secrets to scrub from error messages
         if userinfo:
             u, _, p = userinfo.partition(":")
-            kw["proxy"]["username"] = u
-            kw["proxy"]["password"] = p
-        kw["geoip"] = True
+            # cfm stores credentials percent-encoded (safe for @ : / # etc.)
+            kw["proxy"]["username"] = unquote(u)
+            kw["proxy"]["password"] = unquote(p)
+            enc = f"{scheme}://{quote(unquote(u), safe='')}:{quote(unquote(p), safe='')}@{hostport}"
+            hide = [x for x in (unquote(p), quote(unquote(p), safe=""), p) if x]
+        # Resolve the exit IP here instead of geoip=True: Camoufox rebuilds the
+        # proxy URL without encoding, so a password containing @ / # : breaks
+        # its lookup. Fail closed - never launch with a mismatched geo.
+        from camoufox.ip import public_ip
+        try:
+            kw["geoip"] = public_ip(enc)
+        except Exception as e:
+            msg = str(e)
+            for x in hide:
+                msg = msg.replace(x, "***")
+            sys.exit(f"[!] proxy {_mask_proxy(proxy)} is not working: "
+                     f"{type(e).__name__}: {msg[:160]}")
+        print(f"    exit IP : {kw['geoip']}")
 
     with Camoufox(**kw) as ctx:
         # persistent_context already opened one window - reuse it, don't create
