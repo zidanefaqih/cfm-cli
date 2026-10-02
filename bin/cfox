@@ -29,7 +29,7 @@ _os.environ["XDG_CACHE_HOME"] = str(pathlib.Path(
     or pathlib.Path.home() / ".local" / "share" / "camoufox"))
 
 # Make sure DISPLAY is set (required for headful mode).
-if not _os.environ.get("DISPLAY"):
+if sys.platform.startswith("linux") and not _os.environ.get("DISPLAY"):
     for _d in ("/tmp/.X11-unix",):
         try:
             xs = sorted(pathlib.Path(_d).iterdir())
@@ -50,17 +50,34 @@ CAMO_HOME = pathlib.Path(
 
 def camo_ready():
     """Check that the Camoufox binary exists. Returns (ok, message)."""
-    cfg = CAMO_HOME / "camoufox" / "config.json"
-    if not cfg.exists():
-        return False, f"install dir is empty: {cfg.parent}"
+    candidates = []
     try:
-        active = json.loads(cfg.read_text()).get("active_version", "")
+        from camoufox.pkgman import INSTALL_DIR, LAUNCH_FILE, OS_NAME
+        from camoufox.multiversion import get_active_path
+        active = get_active_path()
+        if active:
+            candidates.append(pathlib.Path(active) / LAUNCH_FILE[OS_NAME])
+        candidates.append(pathlib.Path(INSTALL_DIR) / LAUNCH_FILE[OS_NAME])
     except Exception:
+        pass
+
+    cfg = CAMO_HOME / "camoufox" / "config.json"
+    config_error = False
+    if cfg.exists():
+        try:
+            active = json.loads(cfg.read_text()).get("active_version", "")
+            binary = "camoufox.exe" if _os.name == "nt" else "camoufox-bin"
+            candidates.append(CAMO_HOME / "camoufox" / active / binary)
+        except Exception:
+            config_error = True
+
+    for binary in candidates:
+        if binary.exists():
+            return True, str(binary)
+    if config_error and not candidates:
         return False, "config.json is corrupt"
-    b = CAMO_HOME / "camoufox" / active / "camoufox-bin"
-    if not b.exists():
-        return False, f"binary missing: {b}"
-    return True, str(b)
+    expected = candidates[0] if candidates else cfg.parent
+    return False, f"binary missing: {expected}"
 
 
 # Profile names become directory names and appear in process cmdlines, so keep
@@ -104,64 +121,33 @@ def valid_indices(os_name: str):
         return None
 
 
-# ---- window geometry --------------------------------------------------------
-# Firefox UI height (tab bar + address bar). Measured from real BrowserForge output.
-CHROME_H = 55
+# ---- host screen geometry ---------------------------------------------------
 # Taskbar/panel/dock height per OS, matching Camoufox fix_screen_no_taskbar().
 TASKBAR = {"macos": 25, "windows": 40, "linux": 27}
 
 
-def window_geometry(os_name, preset, want_w, want_h, headless=False):
-    """Compute a CONSISTENT set of screen.* and window.* values.
-
-    Why this is needed: with fingerprint_preset, Camoufox skips
-    generate_fingerprint(), so window.* is never spoofed. Worse, as soon as we
-    write window.* ourselves (_user_set_screen_window becomes True), Camoufox
-    disables clamp_window_dimensions() and fix_screen_no_taskbar() entirely.
-    So every bound is enforced here:
-
-        inner <= outer <= avail <= screen
-        screen.availHeight < screen.height   (never flip the noTaskbar flag)
-    """
+def screen_geometry(os_name, preset, headless=False):
+    """Use the attached display for screen.* and leave window.* native."""
     s = preset.get("screen", {}) or {}
     sw = int(s.get("width") or 1920)
     sh = int(s.get("height") or 1080)
 
-    # Headful: the spoofed screen must not exceed the real monitor, otherwise
-    # Camoufox clamps it itself (clamp_screen_to_display) and the profile no
-    # longer matches its preset.
     if not headless:
         try:
             from camoufox.utils import get_screen_cons
             d = get_screen_cons(False)
             if d and d.max_width and d.max_height:
-                sw = min(sw, int(d.max_width))
-                sh = min(sh, int(d.max_height))
+                sw = int(d.max_width)
+                sh = int(d.max_height)
         except Exception:
             pass
 
-    # availHeight: KEEP the preset value when it is plausible (taskbar 1..200px).
-    # Linux presets often ship availHeight == height (noTaskbar) -> only those
-    # get recomputed from the table above.
     tb = TASKBAR.get(os_name, 27)
-    ah_preset = s.get("availHeight")
-    if ah_preset and 0 < (sh - int(ah_preset)) < 200:
-        ah = int(ah_preset)
-    else:
-        ah = max(sh - tb, 400)
-    ah = min(ah, sh - 1) if sh > 1 else ah        # never equal to height
-
-    # The window MUST fit inside avail: outer <= avail <= screen.
-    w = max(min(want_w, sw), 400)
-    h = max(min(want_h, ah), 300)
-    ih = max(h - CHROME_H, 200)
+    ah = max(sh - tb, 400)
+    ah = min(ah, sh - 1) if sh > 1 else ah
     return {
         "screen.width": sw, "screen.height": sh,
         "screen.availWidth": sw, "screen.availHeight": ah,
-        "window.outerWidth": w, "window.outerHeight": h,
-        "window.innerWidth": w, "window.innerHeight": ih,
-        "window.screenX": max((sw - w) // 2, 0),
-        "window.screenY": max((sh - h) // 2, 0),
     }
 
 
@@ -181,7 +167,9 @@ def pick_preset(os_name: str, min_screen=(1600, 900)) -> dict:
         try: used.add(json.loads(f.read_text()).get("preset_id"))
         except Exception: pass
 
-    avail = [i for i in good if f"{os_name}:{i}" not in used] or good
+    avail = [i for i in good if f"{os_name}:{i}" not in used]
+    if not avail:
+        raise ValueError(f"no unused {os_name} fingerprint presets remain")
     # prefer big-screen presets (viewport fills the window on modern displays)
     big = [i for i in avail
            if (pool[i].get("screen", {}).get("width", 0) >= min_screen[0]
@@ -291,7 +279,9 @@ def main():
     p.add_argument("--list", action="store_true", help="list all profiles")
     p.add_argument("--win", default=None, help="window size WxH (default 1280x800)")
     p.add_argument("--fresh", action="store_true", help="start a fresh session (drop old tabs)")
-    p.add_argument("--no-fs", action="store_true", help="skip automatic fullscreen")
+    p.add_argument("--fs", dest="force_fullscreen", action="store_true",
+                   help="force fullscreen shortly after launch (X11/KWin)")
+    p.add_argument("--no-fs", action="store_true", help=argparse.SUPPRESS)
     a = p.parse_args()
 
     if a.list:
@@ -317,8 +307,23 @@ def main():
     is_new = a.new or not fpath.exists()
     if is_new:
         old = json.loads(fpath.read_text()) if fpath.exists() else {}
-        os_name = a.os or random.choice(OS_LIST)
-        data = pick_preset(os_name)
+        if a.os:
+            os_name = a.os
+            try:
+                data = pick_preset(os_name)
+            except ValueError as e:
+                sys.exit(f"[!] {e}; choose another OS or free a preset")
+        else:
+            data = None
+            for candidate in random.sample(OS_LIST, len(OS_LIST)):
+                try:
+                    data = pick_preset(candidate)
+                    os_name = candidate
+                    break
+                except ValueError:
+                    continue
+            if data is None:
+                sys.exit("[!] No unused fingerprint presets remain; choose another OS or free a preset")
         meta = {"profile": a.profile, "os": os_name, **data}
         # --new regenerates the fingerprint only; keep the saved proxy default.
         for k in ("proxy_port", "proxy_url"):
@@ -341,13 +346,16 @@ def main():
         print(f"[+] {a.profile}  os={os_name}  preset={meta.get('preset_id')}  {'NEW' if is_new else 'stored'}  (gen-only, no launch)")
         return
 
+    runtime_screen = screen_geometry(os_name, preset, headless=a.headless)
+
     if a.show:
         print(f"profile  : {a.profile}")
         print(f"os       : {os_name}")
         print(f"preset   : {meta.get('preset_id')}")
         print(f"UA       : {nav.get('userAgent')}")
         print(f"platform : {nav.get('platform')}  cores={nav.get('hardwareConcurrency')}")
-        print(f"screen   : {preset.get('screen',{}).get('width')}x{preset.get('screen',{}).get('height')}")
+        print(f"preset screen : {preset.get('screen',{}).get('width')}x{preset.get('screen',{}).get('height')}")
+        print(f"runtime screen: {runtime_screen['screen.width']}x{runtime_screen['screen.height']}")
         print(f"webgl    : {json.dumps(preset.get('webgl',{}), default=str)[:140]}")
         if meta.get("proxy_url"):
             pu = _mask_proxy(meta["proxy_url"])
@@ -364,7 +372,7 @@ def main():
 
     print(f"[+] {a.profile}  os={os_name}  preset={meta.get('preset_id')}  {'NEW' if is_new else 'stored'}")
     print(f"    UA      : {nav.get('userAgent','')[:70]}")
-    print(f"    cores   : {nav.get('hardwareConcurrency')}   screen: {preset.get('screen',{}).get('width')}x{preset.get('screen',{}).get('height')}")
+    print(f"    cores   : {nav.get('hardwareConcurrency')}   monitor: {runtime_screen['screen.width']}x{runtime_screen['screen.height']}")
     print(f"    proxy   : {ptxt}")
 
     # Firefox preferences. Session restore stays off on purpose: cookies, logins
@@ -411,14 +419,9 @@ def main():
         # no_viewport: without it Playwright forces a 1280x720 viewport, so a
         # fullscreen window only renders the page in the top-left corner.
         no_viewport=True,
-        # Explicit geometry: with fingerprint_preset, Camoufox skips
-        # generate_fingerprint(), so window.* is never spoofed and
-        # clamp_window_dimensions() is disabled. The generated window could end
-        # up taller than availHeight (outer 1130 vs avail 1050), which is an
-        # impossible geometry. Every bound is computed in window_geometry().
-        config=window_geometry(os_name, preset, win_w, win_h, headless=a.headless),
-        # Writing screen.*/window.* disables all of Camoufox's auto-clamping;
-        # the values are already bounded above, so this is intentional.
+        # Use the active host display for screen.*. Do not pin window.* so the
+        # native viewport follows the actual browser window when it is resized.
+        config=runtime_screen,
         i_know_what_im_doing=True,
         firefox_user_prefs=ff_prefs,
     )
@@ -468,8 +471,9 @@ def main():
                     pass
             threading.Thread(target=_own_ws, daemon=True).start()
 
-        # X11 fallback fullscreen (KWin/X11) - skipped on Hyprland
-        if not a.headless and not a.no_fs and _os.environ.get("DISPLAY") and not _os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        # Fullscreen is opt-in because the X11 helper must wait for the window
+        # to appear, which otherwise causes a delayed jump after launch.
+        if not a.headless and a.force_fullscreen and not a.no_fs and _os.environ.get("DISPLAY") and not _os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
             import threading, subprocess as _sp
             _fs = pathlib.Path.home() / ".local" / "bin" / "cfox-fullscreen.py"
             if _fs.exists():

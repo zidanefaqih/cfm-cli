@@ -15,7 +15,7 @@ from urllib.parse import quote, unquote
 if not _os.environ.get("XDG_CACHE_HOME"):
     _os.environ["XDG_CACHE_HOME"] = str(pathlib.Path(_os.environ.get("CAMOUFOX_HOME", pathlib.Path.home()/".local"/"share"/"camoufox")))
 
-if not _os.environ.get("DISPLAY"):
+if sys.platform.startswith("linux") and not _os.environ.get("DISPLAY"):
     try:
         xs = sorted(pathlib.Path("/tmp/.X11-unix").iterdir())
         if xs: _os.environ["DISPLAY"] = ":" + xs[-1].name.lstrip("X")
@@ -23,10 +23,13 @@ if not _os.environ.get("DISPLAY"):
         pass
 
 ROOT    = pathlib.Path.home() / "camfox-profiles"
-CONFDIR = pathlib.Path.home() / "surfshark-proxy" / "configs"
+if _os.name == "nt":
+    CONFDIR = pathlib.Path(_os.environ.get("LOCALAPPDATA", pathlib.Path.home() / "AppData" / "Local")) / "cfm-cli" / "configs"
+else:
+    CONFDIR = pathlib.Path.home() / "surfshark-proxy" / "configs"
 PROXYURLDIR = CONFDIR  # *.url files with remote proxy URLs live next to wireproxy confs
 VENV    = pathlib.Path.home() / ".camoufox-venv"
-CFOX    = pathlib.Path.home() / ".local/bin/cfox"
+CFOX    = pathlib.Path(__file__).resolve().with_name("cfox")
 HOTSPOT = 1080
 
 # Profile names become directory names and appear in process cmdlines, so keep
@@ -60,8 +63,9 @@ def discover_proxies():
     out = {}
     # The hotspot is ALWAYS listed, even when down, so it can still be saved
     # as a profile default.
-    out["hotspot"] = {"port": HOTSPOT, "desc": "iPhone hotspot (Telkomsel)",
-                      "alive": port_open(HOTSPOT)}
+    if _os.name != "nt":
+        out["hotspot"] = {"port": HOTSPOT, "desc": "iPhone hotspot (Telkomsel)",
+                          "alive": port_open(HOTSPOT)}
     if CONFDIR.exists():
         for f in sorted(CONFDIR.glob("*.conf")):
             t = f.read_text()
@@ -241,13 +245,23 @@ def label_for(port, px=None):
     px = px or discover_proxies()
     return next((k for k,v in px.items() if v["port"]==port), "?")
 
+def host_screen():
+    try:
+        from camoufox.utils import get_screen_cons
+        display = get_screen_cons(False)
+        if display and display.max_width and display.max_height:
+            return int(display.max_width), int(display.max_height)
+    except Exception:
+        pass
+    return None
+
 # ---------------- display ----------------
 def show_list():
     rows = profiles()
     if not rows: print(c("  no profiles yet. type: /new", C.Y)); return
-    px = discover_proxies(); rproxies = remote_proxies()
+    px = discover_proxies(); rproxies = remote_proxies(); monitor = host_screen()
     print()
-    print(c(f"  {'PROFILE':<10}{'OS':<9}{'PRESET':<13}{'CORES':<7}{'SCREEN':<12}{'PROXY':<26}STATUS", C.B))
+    print(c(f"  {'PROFILE':<10}{'OS':<9}{'PRESET':<13}{'CORES':<7}{'MONITOR':<12}{'PROXY':<26}STATUS", C.B))
     print(c("  " + "-"*92, C.D))
     for name, m in rows:
         p=m["preset"]; n=p.get("navigator",{}); s=p.get("screen",{})
@@ -264,9 +278,10 @@ def show_list():
             stat = c("up",C.G) if port_open(port) else c("PROXY DOWN",C.RE)
         else:
             ptxt = c("-- not set --", C.D); stat = ""
+        screen = f"{monitor[0]}x{monitor[1]}" if monitor else f"{s.get('width')}x{s.get('height')}"
         print(f"  {c(name,C.CY):<19}{m['os']:<9}{m['preset_id']:<13}"
               f"{str(n.get('hardwareConcurrency')):<7}"
-              f"{str(s.get('width'))+'x'+str(s.get('height')):<12}{ptxt:<26}{stat}")
+              f"{screen:<12}{ptxt:<26}{stat}")
     print(c(f"\n  total {len(rows)} profiles", C.D))
 
 def show_proxies(test=False):
@@ -367,7 +382,6 @@ def act_new(args):
         port = None if sel == "__none__" else sel
 
     # 4. create
-    pdir = ROOT/name; pdir.mkdir(parents=True, exist_ok=True)
     from camoufox.fingerprints import load_presets
     pres = load_presets().get("presets", {})
     vf = ROOT/"_valid.json"
@@ -375,7 +389,10 @@ def act_new(args):
     pool = pres[os_name]
     good = (valid or {}).get(os_name) or list(range(len(pool)))
     used = {m.get("preset_id") for _,m in profiles()}
-    avail = [i for i in good if f"{os_name}:{i}" not in used] or good
+    avail = [i for i in good if f"{os_name}:{i}" not in used]
+    if not avail:
+        print(c(f"  no unused {os_name} fingerprint presets remain; choose another OS or remove an old profile", C.Y))
+        return
     i = random.choice(avail)
     FONTS = fonts_db()
     omap = {"windows":"win","macos":"mac","linux":"lin"}
@@ -385,12 +402,15 @@ def act_new(args):
     preset = dict(pool[i]); preset["fonts"] = sorted(rng.sample(fl, min(n,len(fl))))
     meta = {"profile":name, "os":os_name, "preset_id":f"{os_name}:{i}", "preset":preset,
             "proxy_port": "__none__" if port is None else int(port)}
+    pdir = ROOT/name; pdir.mkdir(parents=True, exist_ok=True)
     save(pdir, meta)
 
     nv = preset.get("navigator",{}); sc = preset.get("screen",{}); wg = preset.get("webgl",{})
+    monitor = host_screen()
     print(c(f"\n  profile '{name}' created", C.G))
     print(f"    os       : {os_name}  ({os_name}:{i})")
-    print(f"    cores    : {nv.get('hardwareConcurrency')}   screen: {sc.get('width')}x{sc.get('height')}")
+    print(f"    cores    : {nv.get('hardwareConcurrency')}   preset screen: {sc.get('width')}x{sc.get('height')}")
+    print(f"    monitor  : {monitor[0]}x{monitor[1]} (used at runtime)" if monitor else "    monitor  : detected when browser starts")
     print(f"    GPU      : {str(wg.get('unmaskedRenderer'))[:60]}")
     print(f"    fonts    : {len(preset['fonts'])}")
     print(f"    proxy    : {port or 'NO PROXY (real IP!)'}")
@@ -555,7 +575,7 @@ def _launch(name, m, port, bg):
     dim=f"{sc.get('width')}x{sc.get('height')}  {nv.get('hardwareConcurrency')}c"
     # cfox needs the camoufox module: prefer the venv interpreter, because
     # sys.executable may be a system python that lacks it.
-    vpy = VENV / "bin" / "python"
+    vpy = VENV / ("Scripts" / "python.exe" if _os.name == "nt" else "bin" / "python")
     py = str(vpy) if vpy.exists() else sys.executable
     env = {**_os.environ, "CFM_LAUNCHED": "1"}
     if port is None:
@@ -585,9 +605,15 @@ def _launch(name, m, port, bg):
         logdir.mkdir(mode=0o700, parents=True, exist_ok=True)
         logf = logdir / f"{name}.log"
         fd = _os.open(logf, _os.O_WRONLY | _os.O_CREAT | _os.O_APPEND, 0o600)
+        popen_options = {"env": env, "stdin": subprocess.DEVNULL, "stdout": None,
+                         "stderr": subprocess.STDOUT}
+        if _os.name == "nt":
+            popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_options["start_new_session"] = True
         with _os.fdopen(fd, "ab") as log:
-            subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=log,
-                             stderr=subprocess.STDOUT, start_new_session=True)
+            popen_options["stdout"] = log
+            subprocess.Popen(cmd, **popen_options)
         print(c(f"    background - log: {logf}", C.D))
     else:
         subprocess.run(cmd, env=env)
@@ -617,7 +643,11 @@ def act_newfp(args):
     valid = json.loads(vf.read_text()) if vf.exists() else None
     good = (valid or {}).get(os_name) or list(range(len(pres[os_name])))
     used = {mm.get("preset_id") for n,mm in profiles() if n != name}
-    avail = [i for i in good if f"{os_name}:{i}" not in used] or good
+    old = m.get("preset_id")
+    avail = [i for i in good if f"{os_name}:{i}" not in used and f"{os_name}:{i}" != old]
+    if not avail:
+        print(c(f"  no different unused {os_name} fingerprint presets remain; choose another OS or free a preset", C.Y))
+        return
     i = random.choice(avail)
     FONTS = fonts_db()
     omap = {"windows":"win","macos":"mac","linux":"lin"}
@@ -625,7 +655,6 @@ def act_newfp(args):
     fl = FONTS[omap[os_name]]
     n = rng.randint(180,320) if omap[os_name]=="mac" else rng.randint(55,85)
     preset = dict(pres[os_name][i]); preset["fonts"] = sorted(rng.sample(fl, min(n,len(fl))))
-    old = m.get("preset_id")
     m.update({"os":os_name, "preset_id":f"{os_name}:{i}", "preset":preset})
     save(pdir, m)
     print(c(f"  {name}: fingerprint regenerated", C.G))
@@ -639,17 +668,19 @@ def act_info(args):
     if not name or bad_name(name): return
     m = load(ROOT/name)
     if not m: print(c("  profile does not exist", C.RE)); return
-    p=m["preset"]; nv=p.get("navigator",{}); sc=p.get("screen",{}); wg=p.get("webgl",{})
-    print(f"""
-  {c('profile',C.B)}   : {name}
-  {c('os',C.B)}        : {m['os']}   preset={m['preset_id']}
-  {c('UA',C.B)}        : {nv.get('userAgent')}
-  {c('platform',C.B)}  : {nv.get('platform')}   cores={nv.get('hardwareConcurrency')}
-  {c('screen',C.B)}    : {sc.get('width')}x{sc.get('height')}  avail={sc.get('availWidth')}x{sc.get('availHeight')}
-  {c('GPU',C.B)}       : {wg.get('unmaskedRenderer') or wg.get('renderer')}
-  {c('fonts',C.B)}     : {len(p.get('fonts',[]))}
-  {c('proxy',C.B)}     : {'NO PROXY (real IP)' if m.get('proxy_port')=='__none__' else (m.get('proxy_port') or 'not set')}
-""")
+    p=m["preset"]; nv=p.get("navigator",{}); sc=p.get("screen",{}); wg=p.get("webgl",{}); monitor=host_screen()
+    print(f"  {c('profile',C.B)}   : {name}")
+    print(f"  {c('os',C.B)}        : {m['os']}   preset={m['preset_id']}")
+    print(f"  {c('UA',C.B)}        : {nv.get('userAgent')}")
+    print(f"  {c('platform',C.B)}  : {nv.get('platform')}   cores={nv.get('hardwareConcurrency')}")
+    print(f"  {c('preset screen',C.B)} : {sc.get('width')}x{sc.get('height')}")
+    if monitor:
+        print(f"  {c('monitor now',C.B)}   : {monitor[0]}x{monitor[1]} (runtime)")
+    else:
+        print(f"  {c('monitor now',C.B)}   : detected when browser starts")
+    print(f"  {c('GPU',C.B)}       : {wg.get('unmaskedRenderer') or wg.get('renderer')}")
+    print(f"  {c('fonts',C.B)}     : {len(p.get('fonts',[]))}")
+    print(f"  {c('proxy',C.B)}     : {'NO PROXY (real IP)' if m.get('proxy_port')=='__none__' else (m.get('proxy_port') or 'not set')}")
 
 
 def act_rm(args):
