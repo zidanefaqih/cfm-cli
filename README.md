@@ -45,6 +45,10 @@ mkdir -p ~/.local/bin
 cp bin/* ~/.local/bin/
 chmod +x ~/.local/bin/*
 
+# Optional: extra real-GPU identities (see 'Extra GPUs' below).
+mkdir -p ~/.local/share/cfm-cli
+cp extras/gpus.json ~/.local/share/cfm-cli/
+
 # Point the shebang at the venv.
 sed -i "1s|.*|#!$HOME/.camoufox-venv/bin/python|" ~/.local/bin/cfox ~/.local/bin/cfm ~/.local/bin/cfox-verify
 
@@ -148,6 +152,96 @@ starts. `window.*` remains native, so resizing the browser also resizes the page
 viewport. The stored preset screen remains visible as profile metadata, but it is
 not used for the active display dimensions.
 
+## Extra GPUs (extras/gpus.json)
+
+Camoufox's preset pool repeats the same handful of renderer strings, and the
+Linux pool (17 valid presets) is small enough to run out. `extras/gpus.json`
+adds identities drawn from fpgen's pinned model of devices **Firefox has
+actually been recorded reporting**. Each entry carries its own recorded WebGL
+data (WebGL1 + WebGL2), so it needs no row in Camoufox's `webgl_data.db`;
+`cfox`, `cfm` and `cfox-verify` serve it at launch through `bin/cfm_gpu.py`.
+
+Select one explicitly while creating a profile:
+
+```bash
+cfox acc11 --os linux --gpu gtx480
+cfm new acc11 --os linux --gpu gtx480
+```
+
+`--gpu` matches a case-insensitive substring of the vendor or renderer with
+spaces ignored (`gtx480` == `GTX 480`). Without it, extras take part in the
+normal random pool.
+
+**Modern model names are absent on purpose.** Gecko's `SanitizeRenderer`
+collapses every GeForce 900-4000-series, Quadro and RTX part into a single
+representative string before a page sees it, so stock Firefox never reports
+"RTX 4060", "GTX 1050" or "RTX 3050". Measured on a real GTX 1660 SUPER:
+stock Firefox (the default `webgl.sanitize-unmasked-renderer=true`) reports
+`NVIDIA GeForce GTX 980, or similar`, and only with that pref set to `false`
+does it report `NVIDIA GeForce GTX 1660 SUPER/PCIe/SSE2`.
+
+Camoufox's own spoofing bypasses the sanitizer, so a profile *can* be made to
+say "RTX 4060" — but that is the renderer of a user who turned the pref off, a
+rare configuration, and no recorded WebGL parameters exist for such a GPU, so
+they would be borrowed from another device. That is a masking tell, not
+variety, so `--gpu rtx4060` is rejected. The authentic set is the bucket list in
+Mozilla's `dom/canvas/SanitizeRenderer.cpp`; add GPUs from there.
+
+Add a GPU only after confirming Firefox reports it (fpgen's `gpu` node, or a
+real machine). An entry needs `os`, `vendor`, `renderer`, `preset_id`, a
+`preset` with `navigator`/`screen`/`webgl{unmaskedVendor,unmaskedRenderer}`,
+and the full `webgl_data` blob.
+
+## WebGL readback noise (bin/cfm_readpixels.py)
+
+Spoofing the WebGL *identity* is not enough, because the frame itself is still
+drawn by the physical GPU. `gl.readPixels()` returns that framebuffer
+byte-for-byte, and Camoufox does not perturb it. Measured on one machine: two
+profiles carrying different personas returned **identical** `readPixels`
+output, and it was also bit-identical to the same probe run in stock Chrome on
+the host GPU. So every profile on a machine shares one render fingerprint, and
+that fingerprint is the host's real GPU — enough for a site that hashes
+rendered pixels to link all the profiles, and to link them to the operator.
+
+`bin/cfm_readpixels.py` closes the `readPixels` path the same way Camoufox
+already handles 2D canvas: a +-1 LSB perturbation applied on readback, seeded
+per profile and stored as `.cfm-readpixels-seed` inside the profile directory.
+
+Properties: stable per profile (two runs return identical bytes), different
+between profiles, RGB only (alpha untouched), and non-destructive — only the
+returned buffer changes, never the framebuffer. `Function.prototype.toString`
+is proxied so `readPixels` still reports as `[native code]`.
+
+```bash
+cfox lin89            # prints: readPixels: noise on (seed e0f5be5b)
+CFM_READPIXELS_NOISE=0 cfox lin89   # run without the patch (debugging)
+```
+
+**Not covered yet:** `canvas.toDataURL()` / `toBlob()` called directly on a
+WebGL canvas, and drawing a WebGL canvas into a 2D canvas and reading it back
+with `getImageData()`. Both still return the unperturbed physical-GPU pixels.
+Patching those paths means wrapping 2D-context readback, which risks both
+performance and breaking ordinary web apps, so it was left out deliberately.
+
+**Also not covered: child frames.** On Firefox this init script only reaches
+the main frame. A page that runs its WebGL fingerprint inside an iframe never
+sees the noise. Confirmed against pixelscan.net: with the noise installed its
+reported `WebGL Hash` does not change at all, and instrumenting the page
+records zero WebGL calls in the main frame even though the site clearly
+collects canvas data. So treat this as a real improvement on the readback path,
+not as a fix for any specific site.
+
+Check it yourself:
+
+```bash
+cfm-rp-test lin89 lin94             # two profiles -> two different hashes
+cfm-rp-test lin89 lin94 --no-patch  # control -> one hash for both
+```
+
+A pixel-exact uniformity check (clear to an exact colour, read it back, expect
+an exact match) would notice the noise. That is the cost of not leaking the
+GPU, and it is the same trade-off Camoufox already makes for 2D canvas.
+
 ## Proxies
 
 This repo does not tie itself to any proxy provider. `cfm` reads ports from
@@ -200,14 +294,16 @@ supervised instance per config, restarted on failure, logs in the journal.
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp systemd/wireproxy@.service ~/.config/systemd/user/
+cp systemd/wireproxy@.service systemd/surfshark-proxy.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-for c in ~/surfshark-proxy/configs/*.conf; do
-    systemctl --user enable --now "wireproxy@$(basename "$c" .conf).service"
-done
+systemctl --user enable --now surfshark-proxy.service
+systemctl --user restart surfshark-proxy.service
 loginctl enable-linger "$USER"
 journalctl --user -u 'wireproxy@*' -f     # logs
 ```
+
+This also migrates the older launcher: each config is now a separate supervised
+unit, so a temporary DNS failure or a dead tunnel is retried automatically.
 
 `ss-down` stops these units as well as proxies started by `ss-up`.
 

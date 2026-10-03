@@ -1,0 +1,14 @@
+[Unit]
+Description=Surfshark WireGuard SOCKS5 proxy supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/bash -c 'pkill -f "[w]ireproxy -c" || true'
+ExecStart=/bin/bash -c 'for config in %h/surfshark-proxy/configs/*.conf; do [ -f "$config" ] || continue; name=$(basename "$config" .conf); systemctl --user start "wireproxy@$name.service" || true; done'
+ExecStop=/bin/bash -c 'for config in %h/surfshark-proxy/configs/*.conf; do [ -f "$config" ] || continue; name=$(basename "$config" .conf); systemctl --user stop "wireproxy@$name.service" || true; done; pkill -f "[w]ireproxy -c" || true'
+
+[Install]
+WantedBy=default.target

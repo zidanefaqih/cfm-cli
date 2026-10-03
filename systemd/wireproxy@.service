@@ -9,12 +9,13 @@ Description=wireproxy SOCKS5 proxy (%i)
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=%h/surfshark-proxy/configs/%i.conf
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/wireproxy -c %h/surfshark-proxy/configs/%i.conf
 Restart=on-failure
-RestartSec=5
+RestartSec=10
 
 [Install]
 WantedBy=default.target

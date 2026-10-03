@@ -9,6 +9,14 @@ if sys.platform.startswith('linux'):
     os.environ.setdefault('DISPLAY', ':1')
 from camoufox.sync_api import Camoufox
 
+# Serve recorded WebGL data for extra GPUs (extras/gpus.json); absent on a
+# plain install.
+try:
+    from cfm_gpu import install_sample_webgl_patch
+    install_sample_webgl_patch()
+except Exception:
+    pass
+
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cfox')).read()
 ns = {}
 exec(src[src.index('TASKBAR ='):src.index('def pick_preset')], ns)

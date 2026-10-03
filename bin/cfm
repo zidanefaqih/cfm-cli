@@ -32,6 +32,12 @@ VENV    = pathlib.Path.home() / ".camoufox-venv"
 CFOX    = pathlib.Path(__file__).resolve().with_name("cfox")
 HOTSPOT = 1080
 
+# Optional pack of extra real GPUs (extras/gpus.json).
+try:
+    from cfm_gpu import extra_presets
+except Exception:
+    extra_presets = None
+
 # Profile names become directory names and appear in process cmdlines, so keep
 # them to a safe charset (no '/', '..', spaces or shell metacharacters).
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -314,7 +320,7 @@ def show_help():
     print(f"""
 {c('  Camoufox Manager',C.B)} {c('- commands (all also reachable from the arrow menu)',C.D)}
 
-  {c('/new',C.CY)} [name]        wizard: name -> OS -> proxy (arrow keys)
+  {c('/new',C.CY)} [name]        wizard: name -> OS -> proxy (arrow keys); opt. --os, --gpu <text>
   {c('/list',C.CY)}              list profiles and their proxy
   {c('/proxies',C.CY)} [--test]  list proxies; --test checks the exit IP
   {c('/run',C.CY)} [name]        run (arrow menu for profile and proxy when omitted)
@@ -323,7 +329,7 @@ def show_help():
                       (or paste host:port:user:pass / user:pass@host:port)
   {c('/rmproxy',C.CY)} [label]   delete a remote proxy
   {c('/info',C.CY)} <name>       show UA/GPU/screen/cores detail
-  {c('/newfp',C.CY)} <name>      regenerate fingerprint (profile and proxy kept)
+  {c('/newfp',C.CY)} <name>      regenerate fingerprint (profile and proxy kept); opt. --os, --gpu <text>
   {c('/newname',C.CY)} <old> <new>   rename a profile
   {c('/rm',C.CY)} [name]         delete a profile
   {c('/help',C.CY)}   {c('/quit',C.CY)}        help / quit
@@ -338,6 +344,30 @@ def _ask(q):
     if not sys.stdin.isatty():
         return None
     return q.ask()
+
+def preset_pool(os_name, gpu=None):
+    """(preset_id, preset) pairs for one OS: bundled valid pool + extra GPUs.
+
+    `gpu` filters by a case-insensitive substring of the WebGL vendor or
+    renderer (how an extra GPU is selected)."""
+    from camoufox.fingerprints import load_presets
+    pres = load_presets().get("presets", {})
+    pool = pres.get(os_name) or pres.get("windows")
+    vf = ROOT / "_valid.json"
+    valid = json.loads(vf.read_text()) if vf.exists() else None
+    good = (valid or {}).get(os_name) or list(range(len(pool)))
+    items = [(f"{os_name}:{i}", pool[i]) for i in good]
+    if extra_presets is not None:
+        for g in extra_presets(os_name):
+            pid, p = g.get("preset_id"), g.get("preset")
+            if pid and isinstance(p, dict):
+                items.append((pid, p))
+    if gpu:
+        q = re.sub(r"[^a-z0-9]", "", gpu.lower())
+        items = [(pid, p) for pid, p in items
+                 if q in re.sub(r"[^a-z0-9]", "", json.dumps(p.get("webgl", {}), default=str).lower())]
+    return items
+
 
 def act_new(args):
     import questionary
@@ -382,25 +412,25 @@ def act_new(args):
         port = None if sel == "__none__" else sel
 
     # 4. create
-    from camoufox.fingerprints import load_presets
-    pres = load_presets().get("presets", {})
-    vf = ROOT/"_valid.json"
-    valid = json.loads(vf.read_text()) if vf.exists() else None
-    pool = pres[os_name]
-    good = (valid or {}).get(os_name) or list(range(len(pool)))
+    gpu = None
+    if "--gpu" in rest:
+        i = rest.index("--gpu")
+        if i+1 < len(rest): gpu = rest[i+1]
+    items = preset_pool(os_name, gpu)
     used = {m.get("preset_id") for _,m in profiles()}
-    avail = [i for i in good if f"{os_name}:{i}" not in used]
+    avail = [(pid, p) for pid, p in items if pid not in used]
     if not avail:
-        print(c(f"  no unused {os_name} fingerprint presets remain; choose another OS or remove an old profile", C.Y))
+        extra = f" matching --gpu {gpu!r}" if gpu else ""
+        print(c(f"  no unused {os_name} fingerprint presets remain{extra}; choose another OS or remove an old profile", C.Y))
         return
-    i = random.choice(avail)
+    pid, pick = random.choice(avail)
     FONTS = fonts_db()
     omap = {"windows":"win","macos":"mac","linux":"lin"}
-    rng = random.Random(f"{os_name}:{i}")
+    rng = random.Random(pid)
     fl = FONTS[omap[os_name]]
     n = rng.randint(180,320) if omap[os_name]=="mac" else rng.randint(55,85)
-    preset = dict(pool[i]); preset["fonts"] = sorted(rng.sample(fl, min(n,len(fl))))
-    meta = {"profile":name, "os":os_name, "preset_id":f"{os_name}:{i}", "preset":preset,
+    preset = dict(pick); preset["fonts"] = sorted(rng.sample(fl, min(n,len(fl))))
+    meta = {"profile":name, "os":os_name, "preset_id":pid, "preset":preset,
             "proxy_port": "__none__" if port is None else int(port)}
     pdir = ROOT/name; pdir.mkdir(parents=True, exist_ok=True)
     save(pdir, meta)
@@ -408,7 +438,7 @@ def act_new(args):
     nv = preset.get("navigator",{}); sc = preset.get("screen",{}); wg = preset.get("webgl",{})
     monitor = host_screen()
     print(c(f"\n  profile '{name}' created", C.G))
-    print(f"    os       : {os_name}  ({os_name}:{i})")
+    print(f"    os       : {os_name}  ({pid})")
     print(f"    cores    : {nv.get('hardwareConcurrency')}   preset screen: {sc.get('width')}x{sc.get('height')}")
     print(f"    monitor  : {monitor[0]}x{monitor[1]} (used at runtime)" if monitor else "    monitor  : detected when browser starts")
     print(f"    GPU      : {str(wg.get('unmaskedRenderer'))[:60]}")
@@ -575,7 +605,7 @@ def _launch(name, m, port, bg):
     dim=f"{sc.get('width')}x{sc.get('height')}  {nv.get('hardwareConcurrency')}c"
     # cfox needs the camoufox module: prefer the venv interpreter, because
     # sys.executable may be a system python that lacks it.
-    vpy = VENV / ("Scripts" / "python.exe" if _os.name == "nt" else "bin" / "python")
+    vpy = VENV / ("Scripts/python.exe" if _os.name == "nt" else "bin/python")
     py = str(vpy) if vpy.exists() else sys.executable
     env = {**_os.environ, "CFM_LAUNCHED": "1"}
     if port is None:
@@ -637,28 +667,29 @@ def act_newfp(args):
                     choices=[questionary.Choice(f"{o} (currently: {m['os']})", o)
                              for o in ["windows","macos","linux"]]))
         if not os_name: print(c("  cancelled",C.Y)); return
-    from camoufox.fingerprints import load_presets
-    pres = load_presets().get("presets", {})
-    vf = ROOT/"_valid.json"
-    valid = json.loads(vf.read_text()) if vf.exists() else None
-    good = (valid or {}).get(os_name) or list(range(len(pres[os_name])))
+    gpu = None
+    if "--gpu" in args:
+        i = args.index("--gpu")
+        if i+1 < len(args): gpu = args[i+1]
+    items = preset_pool(os_name, gpu)
     used = {mm.get("preset_id") for n,mm in profiles() if n != name}
     old = m.get("preset_id")
-    avail = [i for i in good if f"{os_name}:{i}" not in used and f"{os_name}:{i}" != old]
+    avail = [(pid, p) for pid, p in items if pid not in used and pid != old]
     if not avail:
-        print(c(f"  no different unused {os_name} fingerprint presets remain; choose another OS or free a preset", C.Y))
+        extra = f" matching --gpu {gpu!r}" if gpu else ""
+        print(c(f"  no different unused {os_name} fingerprint presets remain{extra}; choose another OS or free a preset", C.Y))
         return
-    i = random.choice(avail)
+    pid, pick = random.choice(avail)
     FONTS = fonts_db()
     omap = {"windows":"win","macos":"mac","linux":"lin"}
-    rng = random.Random(f"{os_name}:{i}-{random.randint(0,9999)}")
+    rng = random.Random(f"{pid}-{random.randint(0,9999)}")
     fl = FONTS[omap[os_name]]
     n = rng.randint(180,320) if omap[os_name]=="mac" else rng.randint(55,85)
-    preset = dict(pres[os_name][i]); preset["fonts"] = sorted(rng.sample(fl, min(n,len(fl))))
-    m.update({"os":os_name, "preset_id":f"{os_name}:{i}", "preset":preset})
+    preset = dict(pick); preset["fonts"] = sorted(rng.sample(fl, min(n,len(fl))))
+    m.update({"os":os_name, "preset_id":pid, "preset":preset})
     save(pdir, m)
     print(c(f"  {name}: fingerprint regenerated", C.G))
-    print(f"    {old}  ->  {os_name}:{i}   proxy kept {m.get('proxy_port')}")
+    print(f"    {old}  ->  {pid}   proxy kept {m.get('proxy_port')}")
 
 
 def act_info(args):
@@ -892,12 +923,14 @@ def main():
     ap = argparse.ArgumentParser(prog="cfm")
     ap.add_argument("cmd", nargs="?"); ap.add_argument("args", nargs="*")
     ap.add_argument("--os", choices=["windows","macos","linux"])
+    ap.add_argument("--gpu", default=None, help="only pick a preset whose WebGL vendor/renderer contains this text (e.g. gtx480)")
     ap.add_argument("--port", type=int); ap.add_argument("--bg", action="store_true")
     ap.add_argument("--test", action="store_true"); ap.add_argument("--noproxy", action="store_true")
     a = ap.parse_args()
     if not a.cmd: interactive(); return
     extra = []
     if a.os: extra += ["--os", a.os]
+    if a.gpu: extra += ["--gpu", a.gpu]
     if a.port: extra += ["--port", str(a.port)]
     if a.noproxy: extra += ["--noproxy"]
     d = {"list": lambda: show_list(),

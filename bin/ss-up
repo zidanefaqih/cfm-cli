@@ -4,11 +4,27 @@ CONFDIR="$HOME/surfshark-proxy/configs"
 LOGDIR="$HOME/surfshark-proxy/logs"
 mkdir -p "$LOGDIR"
 COUNT=0
+USE_SYSTEMD=0
+if command -v systemctl >/dev/null 2>&1 && \
+    [ -f "$HOME/.config/systemd/user/wireproxy@.service" ] && \
+    systemctl --user show-environment >/dev/null 2>&1; then
+    USE_SYSTEMD=1
+fi
+
 for CONF in "$CONFDIR"/*.conf; do
     [ -f "$CONF" ] || continue
     NAME=$(basename "$CONF" .conf)
     PORT=$(grep -A2 '\[Socks5\]' "$CONF" | grep -oP '(?<=:)\d+$' | head -1)
     [ -z "$PORT" ] && continue
+    if [ "$USE_SYSTEMD" -eq 1 ]; then
+        if systemctl --user start "wireproxy@$NAME.service"; then
+            echo -e "\e[32m[+] $NAME (port $PORT) managed by systemd\e[0m"
+            COUNT=$((COUNT+1))
+        else
+            echo -e "\e[31m[✗] $NAME (port $PORT) failed to start\e[0m"
+        fi
+        continue
+    fi
     if pgrep -f "wireproxy -c $CONF" >/dev/null 2>&1; then
         echo -e "\e[33m[=] $NAME (port $PORT) already running\e[0m"; continue
     fi
@@ -17,7 +33,11 @@ for CONF in "$CONFDIR"/*.conf; do
     echo -e "\e[32m[+] $NAME (port $PORT) started\e[0m"
     COUNT=$((COUNT+1))
 done
-sleep 6
+if [ "$USE_SYSTEMD" -eq 1 ]; then
+    sleep 12
+else
+    sleep 6
+fi
 echo "---"
 for CONF in "$CONFDIR"/*.conf; do
     [ -f "$CONF" ] || continue

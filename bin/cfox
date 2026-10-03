@@ -41,6 +41,21 @@ if sys.platform.startswith("linux") and not _os.environ.get("DISPLAY"):
 from camoufox.sync_api import Camoufox
 from camoufox.fingerprints import load_presets, get_random_preset
 
+# Optional pack of extra real GPUs (extras/gpus.json). Absent on a plain
+# install, so cfox stays usable without it.
+try:
+    from cfm_gpu import extra_presets, install_sample_webgl_patch
+except Exception:
+    extra_presets = None
+    install_sample_webgl_patch = None
+
+# Per-profile noise for the WebGL pixel readback path (AF-006). Optional: cfox
+# still works when this file is missing.
+try:
+    import cfm_readpixels
+except Exception:
+    cfm_readpixels = None
+
 ROOT = pathlib.Path.home() / "camfox-profiles"
 OS_LIST = ["windows", "macos", "linux"]
 CAMO_HOME = pathlib.Path(
@@ -151,31 +166,60 @@ def screen_geometry(os_name, preset, headless=False):
     }
 
 
-def pick_preset(os_name: str, min_screen=(1600, 900)) -> dict:
+def preset_items(os_name):
+    """(preset_id, preset) pairs: bundled valid pool + extra GPUs.
+
+    Extra entries carry their own WebGL data, so they are valid by
+    construction and bypass _valid.json."""
+    pres = load_presets().get("presets", {})
+    pool = pres.get(os_name) or pres.get("windows")
+    good = valid_indices(os_name) or list(range(len(pool)))
+    items = [(f"{os_name}:{i}", pool[i]) for i in good]
+    if extra_presets is not None:
+        for g in extra_presets(os_name):
+            pid, p = g.get("preset_id"), g.get("preset")
+            if pid and isinstance(p, dict):
+                items.append((pid, p))
+    return items
+
+
+def _gpu_key(text):
+    """Normalise a GPU query/value so 'gtx480' matches 'GTX 480'."""
+    return re.sub(r"[^a-z0-9]", "", str(text).lower())
+
+
+def pick_preset(os_name: str, min_screen=(1600, 900), gpu=None) -> dict:
     """Pick a random VALID preset, preferring ones not used by other profiles.
 
     Prefers presets whose screen is at least min_screen so the browser
     viewport fills the window nicely on modern monitors (small presets like
     1184x666 render a tiny page inside a big window). Presets are still
-    real-device fingerprints; only the size class is preferred."""
-    pres = load_presets().get("presets", {})
-    pool = pres.get(os_name) or pres.get("windows")
-    good = valid_indices(os_name) or list(range(len(pool)))
+    real-device fingerprints; only the size class is preferred.
+
+    `gpu` filters by a case-insensitive substring of the WebGL vendor or
+    renderer, which is how an extra GPU from extras/gpus.json is selected."""
+    items = preset_items(os_name)
+    if gpu:
+        q = _gpu_key(gpu)
+        items = [(pid, p) for pid, p in items
+                 if q in _gpu_key(json.dumps(p.get("webgl", {}), default=str))]
 
     used = set()
     for f in ROOT.glob("*/fingerprint.json"):
         try: used.add(json.loads(f.read_text()).get("preset_id"))
         except Exception: pass
 
-    avail = [i for i in good if f"{os_name}:{i}" not in used]
+    avail = [(pid, p) for pid, p in items if pid not in used]
     if not avail:
+        if gpu:
+            raise ValueError(f"no unused {os_name} preset matches --gpu {gpu!r}")
         raise ValueError(f"no unused {os_name} fingerprint presets remain")
     # prefer big-screen presets (viewport fills the window on modern displays)
-    big = [i for i in avail
-           if (pool[i].get("screen", {}).get("width", 0) >= min_screen[0]
-               and pool[i].get("screen", {}).get("height", 0) >= min_screen[1])]
-    i = random.choice(big or avail)
-    return {"preset_id": f"{os_name}:{i}", "preset": pool[i]}
+    big = [(pid, p) for pid, p in avail
+           if (p.get("screen", {}).get("width", 0) >= min_screen[0]
+               and p.get("screen", {}).get("height", 0) >= min_screen[1])]
+    pid, p = random.choice(big or avail)
+    return {"preset_id": pid, "preset": p}
 
 
 def list_profiles():
@@ -271,6 +315,9 @@ def main():
     p.add_argument("--noproxy", action="store_true",
                    help="run WITHOUT a proxy (real IP) and save that as the default")
     p.add_argument("--os", default=None, choices=OS_LIST, help="OS (random when creating a new profile)")
+    p.add_argument("--gpu", default=None,
+                   help="only pick a preset whose WebGL vendor/renderer contains this text "
+                        "(e.g. gtx480); used to test extra GPUs from extras/gpus.json")
     p.add_argument("--url", default="https://iphey.com")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--new", action="store_true", help="REGENERATE this profile's fingerprint")
@@ -300,6 +347,11 @@ def main():
         print("  Fix:\n    camoufox fetch\n")
         sys.exit(1)
 
+    # extra GPUs are not in Camoufox's bundled webgl_data.db; serve their
+    # recorded data before launching.
+    if install_sample_webgl_patch is not None:
+        install_sample_webgl_patch()
+
     pdir = ROOT / a.profile
     pdir.mkdir(parents=True, exist_ok=True)
     fpath = pdir / "fingerprint.json"
@@ -310,20 +362,22 @@ def main():
         if a.os:
             os_name = a.os
             try:
-                data = pick_preset(os_name)
+                data = pick_preset(os_name, gpu=a.gpu)
             except ValueError as e:
                 sys.exit(f"[!] {e}; choose another OS or free a preset")
         else:
             data = None
             for candidate in random.sample(OS_LIST, len(OS_LIST)):
                 try:
-                    data = pick_preset(candidate)
+                    data = pick_preset(candidate, gpu=a.gpu)
                     os_name = candidate
                     break
                 except ValueError:
                     continue
             if data is None:
-                sys.exit("[!] No unused fingerprint presets remain; choose another OS or free a preset")
+                sys.exit("[!] No unused fingerprint presets remain"
+                         + (f" matching --gpu {a.gpu!r}" if a.gpu else "")
+                         + "; choose another OS or free a preset")
         meta = {"profile": a.profile, "os": os_name, **data}
         # --new regenerates the fingerprint only; keep the saved proxy default.
         for k in ("proxy_port", "proxy_url"):
@@ -452,6 +506,19 @@ def main():
         print(f"    exit IP : {kw['geoip']}")
 
     with Camoufox(**kw) as ctx:
+        # AF-006: WebGL *parameters* are spoofed, but the frame itself is drawn
+        # by the physical GPU and readPixels hands it back verbatim -- so every
+        # profile on this machine shares one render fingerprint, and it also
+        # matches the host's own browser. Perturb just the readback, per
+        # profile. Must be installed before the first navigation.
+        if cfm_readpixels is not None and cfm_readpixels.enabled():
+            try:
+                _rp_seed = cfm_readpixels.ensure_seed(pdir)
+                cfm_readpixels.install(ctx, _rp_seed)
+                print(f"    readPixels: noise on (seed {_rp_seed:08x})")
+            except Exception as exc:
+                print(f"[!] readPixels noise skipped: {exc.__class__.__name__}: {exc}")
+
         # persistent_context already opened one window - reuse it, don't create
         # a second one.
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
