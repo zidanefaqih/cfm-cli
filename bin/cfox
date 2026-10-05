@@ -305,6 +305,56 @@ def _mask_proxy(url):
     return f"{scheme}://{hostport}" if userinfo else url
 
 
+# ---------------- desktop fonts (AF-005) ----------------
+# `cfm-fonts apply` symlinks a real desktop font set into Camoufox's Linux
+# persona and records which names now resolve. Read that here.
+FONT_MANIFEST_DIR = pathlib.Path.home() / ".local" / "share" / "cfm-fonts"
+
+
+def desktop_font_names(os_name):
+    """Font names the persona can really render, per the cfm-fonts manifest.
+
+    Camoufox's Linux bundle ships only Arimo, Cousine, Tinos and the Noto
+    script fonts. A page enumerating the usual desktop names (Arial, DejaVu
+    Sans, Liberation Sans, ...) therefore finds *nothing*, which reads as a
+    stripped browser rather than a desktop -- see AF-005. cfm-fonts adds the
+    missing fonts and writes a manifest; without it this returns [] and
+    Camoufox's own behaviour is untouched.
+    """
+    if os_name != "linux":
+        return []
+    mp = FONT_MANIFEST_DIR / "linux-desktop.manifest.json"
+    try:
+        names = json.loads(mp.read_text()).get("font_names") or []
+    except Exception:
+        return []
+    return sorted({n for n in names if isinstance(n, str) and n})
+
+
+def with_desktop_fonts(kw, os_name):
+    """Add the desktop font names to the spoofed font list. Returns the count.
+
+    The full bundle list is used rather than Camoufox's random per-launch
+    subset: the subset advertises fewer names than the bundle can render, and
+    measured on this host it made *fewer* fonts detectable than not passing a
+    list at all (16 vs 29 out of the Linux list). A real desktop's font set
+    does not change between sessions either, so a stable list is also the more
+    honest model. Verified: 33 detectable, against 29 without the desktop set.
+    """
+    extra = desktop_font_names(os_name)
+    if not extra:
+        return 0
+    key = {"linux": "lin", "windows": "win", "macos": "mac"}.get(os_name)
+    base = []
+    try:
+        from camoufox.fingerprints import _load_os_fonts
+        base = _load_os_fonts().get(key, []) if key else []
+    except Exception:
+        base = []
+    kw["fonts"] = sorted(set(base) | set(extra))
+    return len(extra)
+
+
 def main():
     p = argparse.ArgumentParser(description="Camoufox multi-profile launcher")
     p.add_argument("profile", nargs="?", help="profile name")
@@ -504,6 +554,10 @@ def main():
             sys.exit(f"[!] proxy {_mask_proxy(proxy)} is not working: "
                      f"{type(e).__name__}: {msg[:160]}")
         print(f"    exit IP : {kw['geoip']}")
+
+    n_fonts = with_desktop_fonts(kw, os_name)
+    if n_fonts:
+        print(f"    fonts   : +{n_fonts} desktop names (cfm-fonts)")
 
     with Camoufox(**kw) as ctx:
         # AF-006: WebGL *parameters* are spoofed, but the frame itself is drawn

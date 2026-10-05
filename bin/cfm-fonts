@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""Give Camoufox's Linux persona a realistic desktop font set.
+
+Why
+---
+Camoufox bundles a font set per OS (Tor Browser's model: standardize fonts so
+profiles cannot be told apart). The Windows and macOS bundles are complete --
+they ship arial.ttf, calibri.ttf, Helvetica, Geneva and so on, so a page that
+enumerates the usual names finds them.
+
+The **Linux** bundle is not. It ships only Arimo, Cousine, Tinos (the metric
+substitutes for Arial / Courier New / Times New Roman) plus the Noto script
+fonts. There is no DejaVu, no Liberation, no Noto Sans base family, no Ubuntu.
+A real Linux desktop has all of those, so a font enumeration that asks for the
+usual desktop names gets **zero hits** from a Linux Camoufox profile -- which
+is what a hardened / stripped browser looks like, not a desktop.
+
+This tool closes that gap: it symlinks a curated set of real desktop fonts into
+a stable pack directory and patches the bundled Linux fontconfig to (a) expose
+that directory and (b) add the metric aliases a normal system fontconfig would
+provide (Arial -> Liberation Sans, and so on).
+
+What it deliberately does NOT do
+--------------------------------
+* It does not touch the generic family defaults (`sans-serif` -> Arimo,
+  `serif` -> Tinos, `monospace` -> Cousine). Changing those alters how every
+  page renders; the point here is only to stop the font list looking stripped.
+* It does not add Windows/macOS-only families (Segoe UI, Calibri, Consolas,
+  Helvetica Neue). A real Linux desktop does not resolve those, so leaving them
+  unresolved is the correct, realistic behaviour.
+* It does not randomize per profile. Every Linux profile gets the same desktop
+  set -- the same as a real desktop would. Per-profile subsets would add
+  entropy but need a per-profile fontconfig; see the vault (AF-005).
+
+The patch lives inside the versioned browser bundle, so it is lost when
+Camoufox is upgraded or re-fetched. Re-run `cfm-fonts apply` after that; the
+font pack itself is kept outside the bundle and survives.
+
+Usage:
+  cfm-fonts                 # apply (idempotent)
+  cfm-fonts status          # is it applied, and what does the pack hold
+  cfm-fonts revert          # remove the patch (font pack is left alone)
+  cfm-fonts --install-dir DIR
+"""
+import argparse
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+MARKER = "cfm-desktop-fonts"
+
+# Families a normal Linux desktop has. Chosen to match a Debian/Ubuntu/Fedora
+# install: DejaVu is the default, Liberation provides the metric-compatible
+# replacements, Noto covers the base sans, Ubuntu/FreeSans/Nimbus come along
+# with the distro or the URW base35 package.
+FAMILIES = [
+    "DejaVu Sans",
+    "DejaVu Serif",
+    "DejaVu Sans Mono",
+    "Liberation Sans",
+    "Liberation Serif",
+    "Liberation Mono",
+    "Noto Sans",
+    "Ubuntu",
+    "FreeSans",
+    "FreeSerif",
+    "FreeMono",
+    "Nimbus Sans",
+    "Nimbus Roman",
+    "Nimbus Mono PS",
+]
+
+# Metric aliases, mirroring fontconfig's 30-metric-aliases.conf. The Tor
+# fontconfig is standalone (it includes no system conf), so without these the
+# names still resolve to nothing even once the fonts are present.
+#
+# Only the pairs a stock system fontconfig actually maps are listed. Verdana,
+# Georgia, Tahoma and Trebuchet MS have no metric-compatible free equivalent,
+# so a real Linux desktop does not resolve them either -- adding aliases for
+# those would make the profile *less* realistic, not more.
+ALIASES = [
+    ("Arial", ["Liberation Sans", "Nimbus Sans"]),
+    ("Helvetica", ["Liberation Sans", "Nimbus Sans"]),
+    ("Arial Narrow", ["Liberation Sans Narrow", "Nimbus Sans Narrow"]),
+    ("Times New Roman", ["Liberation Serif", "Nimbus Roman"]),
+    ("Courier New", ["Liberation Mono", "Nimbus Mono PS"]),
+]
+
+PACK_DEFAULT = pathlib.Path.home() / ".local" / "share" / "cfm-fonts" / "linux-desktop"
+
+
+def find_install_dir(explicit=None):
+    """The camoufox install root (the dir holding fonts/ and fontconfig/)."""
+    if explicit:
+        return pathlib.Path(explicit).expanduser()
+    env = os.environ.get("CAMOUFOX_HOME") or os.environ.get("XDG_CACHE_HOME")
+    roots = []
+    if env:
+        roots.append(pathlib.Path(env))
+    roots.append(pathlib.Path.home() / ".local" / "share" / "camoufox-setup")
+    roots.append(pathlib.Path.home() / ".local" / "share" / "camoufox")
+    roots.append(pathlib.Path.home() / ".cache" / "camoufox")
+    for root in roots:
+        for cand in (root / "camoufox", root):
+            if (cand / "browsers").is_dir():
+                return cand
+    return None
+
+
+def find_browser_dir(install):
+    """The versioned browser dir that holds fonts/ and fontconfig/."""
+    browsers = install / "browsers"
+    for channel in ("official", "stable", "beta"):
+        d = browsers / channel
+        if not d.is_dir():
+            continue
+        subs = sorted((p for p in d.iterdir() if p.is_dir()), reverse=True)
+        for s in subs:
+            if (s / "fontconfig").is_dir() or (s / "fonts").is_dir():
+                return s
+    return None
+
+
+def font_files(families):
+    """Map family -> list of font files, via fc-list. Missing families are skipped."""
+    out, missing = {}, []
+    for fam in families:
+        try:
+            r = subprocess.run(["fc-list", f":family={fam}", "file"],
+                               capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            r = None
+        files = []
+        if r and r.returncode == 0:
+            for line in r.stdout.splitlines():
+                path = line.split(":", 1)[0].strip()
+                if path and pathlib.Path(path).is_file():
+                    files.append(pathlib.Path(path))
+        if files:
+            out[fam] = sorted(set(files))
+        else:
+            missing.append(fam)
+    return out, missing
+
+
+def build_pack(pack_dir, families):
+    """Symlink the chosen fonts into the pack dir.
+
+    Returns (added, removed, missing, present) where `present` is the families
+    that were actually found on this host.
+    """
+    found, missing = font_files(families)
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    wanted = {f for files in found.values() for f in files}
+    added = removed = 0
+    for f in sorted(wanted):
+        dest = pack_dir / f.name
+        if dest.is_symlink() and pathlib.Path(os.readlink(dest)) == f:
+            continue
+        if dest.exists() or dest.is_symlink():
+            dest.unlink()
+            removed += 1
+        os.symlink(f, dest)
+        added += 1
+    # drop links for families that no longer exist on the host
+    for dest in pack_dir.iterdir():
+        if dest.is_symlink() and pathlib.Path(os.readlink(dest)) not in wanted:
+            dest.unlink()
+            removed += 1
+    return added, removed, missing, sorted(found)
+
+
+def manifest_path(pack_dir):
+    return pack_dir.parent / (pack_dir.name + ".manifest.json")
+
+
+def write_manifest(pack_dir, present):
+    """Record which font names the persona can now resolve.
+
+    cfox reads this so the spoofed font list only ever advertises fonts that
+    really exist -- a list naming fonts the browser cannot render would be a
+    detectable contradiction between the reported list and the measurements.
+    Only the alias targets that are present are kept, for the same reason.
+    """
+    have = set(present)
+    alias_names = [name for name, targets in ALIASES if any(t in have for t in targets)]
+    data = {
+        "os": "linux",
+        "pack": str(pack_dir),
+        "families": present,
+        "alias_names": alias_names,
+        "font_names": sorted(have | set(alias_names)),
+    }
+    mp = manifest_path(pack_dir)
+    mp.write_text(json.dumps(data, indent=1) + "\n")
+    return mp
+
+
+def conf_block(pack_dir):
+    lines = [
+        f"<!-- {MARKER}: start (managed by cfm-fonts, do not edit by hand) -->",
+        "<!--",
+        "  Real desktop fonts plus the metric aliases a normal system",
+        "  fontconfig provides. Camoufox's Linux bundle ships only Arimo,",
+        "  Cousine, Tinos and the Noto script fonts, so a page enumerating the",
+        "  usual desktop names finds nothing, which reads as a stripped",
+        "  browser rather than a desktop.",
+        "-->",
+        f"\t<dir>{pack_dir}</dir>",
+    ]
+    for name, targets in ALIASES:
+        for t in targets:
+            lines += [
+                '\t<match target="pattern">',
+                '\t\t<test qual="any" name="family">',
+                f"\t\t\t<string>{name}</string>",
+                "\t\t</test>",
+                '\t\t<edit name="family" mode="assign" binding="same">',
+                f"\t\t\t<string>{t}</string>",
+                "\t\t</edit>",
+                "\t</match>",
+            ]
+    lines.append(f"<!-- {MARKER}: end -->")
+    return "\n".join(lines)
+
+
+def strip_block(text):
+    pattern = re.compile(
+        r"\n?<!-- " + re.escape(MARKER) + r": start.*?<!-- " + re.escape(MARKER) + r": end -->\n?",
+        re.S,
+    )
+    return pattern.sub("\n", text)
+
+
+def _check_xml(text, conf_path):
+    """fontconfig silently falls back to the system config on a parse error, so
+    a malformed patch would look like it worked while changing everything.
+    An XML comment may not contain '--' either, which is easy to write by hand."""
+    import xml.etree.ElementTree as ET
+    try:
+        ET.fromstring(text)
+    except ET.ParseError as e:
+        raise SystemExit(f"[!] refusing to write invalid XML to {conf_path}: {e}")
+
+
+def patch_conf(conf_path, pack_dir):
+    """Insert the block before </fontconfig>. Idempotent. Returns True if changed."""
+    original = conf_path.read_text()
+    stripped = strip_block(original)
+    if "</fontconfig>" not in stripped:
+        raise SystemExit(f"[!] {conf_path} has no </fontconfig>; refusing to patch")
+    patched = stripped.replace("</fontconfig>", conf_block(pack_dir) + "\n\n</fontconfig>", 1)
+    if patched == original:
+        return False
+    _check_xml(patched, conf_path)
+    conf_path.write_text(patched)
+    return True
+
+
+def conf_state(conf_path):
+    text = conf_path.read_text()
+    m = re.search(r"<!-- " + re.escape(MARKER) + r": start.*?<dir>(.*?)</dir>", text, re.S)
+    return m.group(1) if m else None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("action", nargs="?", default="apply", choices=["apply", "status", "revert"])
+    ap.add_argument("--install-dir", default=None, help="camoufox install root (auto-detected)")
+    ap.add_argument("--pack", default=str(PACK_DEFAULT), help="font pack directory")
+    ap.add_argument("--os", default="linux", help="persona fontconfig to patch (default: linux)")
+    a = ap.parse_args()
+
+    install = find_install_dir(a.install_dir)
+    if not install:
+        raise SystemExit("[!] camoufox install not found; pass --install-dir")
+    browser = find_browser_dir(install)
+    if not browser:
+        raise SystemExit(f"[!] no versioned browser dir under {install}/browsers")
+    conf = browser / "fontconfig" / a.os / "fonts.conf"
+    if not conf.is_file():
+        raise SystemExit(f"[!] {conf} not found")
+    pack = pathlib.Path(a.pack).expanduser()
+
+    if a.action == "status":
+        cur = conf_state(conf)
+        print(f"install   : {install}")
+        print(f"browser   : {browser.name}")
+        print(f"conf      : {conf}")
+        print(f"patch     : {'APPLIED -> ' + cur if cur else 'not applied'}")
+        n = len(list(pack.iterdir())) if pack.is_dir() else 0
+        print(f"pack      : {pack} ({n} files)")
+        mp = manifest_path(pack)
+        if mp.is_file():
+            d = json.loads(mp.read_text())
+            print(f"manifest  : {mp}")
+            print(f"  families: {', '.join(d.get('families', []))}")
+            print(f"  aliases : {', '.join(d.get('alias_names', []))}")
+        else:
+            print(f"manifest  : {mp} (absent -- cfox will not extend the font list)")
+        try:
+            import xml.etree.ElementTree as ET
+            ET.fromstring(conf.read_text())
+            print("xml       : well-formed")
+        except Exception as e:
+            print(f"xml       : INVALID ({e}) -- fontconfig will ignore it")
+        return 0
+
+    if a.action == "revert":
+        if strip_block(conf.read_text()) != conf.read_text():
+            conf.write_text(strip_block(conf.read_text()))
+            print(f"[+] patch removed from {conf}")
+        else:
+            print("[=] nothing to remove")
+        return 0
+
+    added, removed, missing, present = build_pack(pack, FAMILIES)
+    print(f"[+] font pack: {pack}")
+    print(f"    {added} symlink(s) added, {removed} replaced/removed")
+    if missing:
+        print(f"    not on this host (skipped): {', '.join(missing)}")
+    mp = write_manifest(pack, present)
+    print(f"[+] manifest: {mp}")
+    if patch_conf(conf, pack):
+        print(f"[+] patched {conf}")
+    else:
+        print(f"[=] {conf} already patched")
+    print("\n    Next launch of any Linux profile picks this up. Camoufox caches")
+    print("    the generated fontconfig by content hash, so the new file is used")
+    print("    automatically. Re-run this after a Camoufox upgrade.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
