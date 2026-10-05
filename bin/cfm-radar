@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Show the WorkOS device_fingerprint that a Cline login attempt produced.
+
+device_fingerprint is not something the browser stores. WorkOS computes it
+server-side from the signals its Radar script collected, then carries it
+through the whole OAuth redirect chain inside the `state` query parameter:
+
+    api.workos.com/user_management/authorize?state=<JWT>
+      -> accounts.google.com/o/oauth2/v2/auth?state=<same JWT>
+      -> auth.workos.com/sso/oauth/google/<env>/callback?state=<same JWT>
+      -> authkit.cline.bot/api/callback?state=<same JWT>
+
+`state` is a JWT. Its payload holds `device_fingerprint`, `signals_id`,
+`source` (signup/signin), `provider`, `authorization_session_id` and `iat`.
+Reading it back out of a profile's history is how we tell whether two
+profiles looked like the same device to Radar.
+
+Usage:
+  cfm-radar                 # every profile that has Cline history
+  cfm-radar sg1 sg2 lin87   # only these
+  cfm-radar --verbose sg2   # print the full JWT payload for one profile
+"""
+import argparse
+import base64
+import datetime
+import glob
+import json
+import os
+import pathlib
+import re
+import shutil
+import sqlite3
+import sys
+import tempfile
+import urllib.parse
+
+PROFILES = pathlib.Path.home() / "camfox-profiles"
+
+
+def b64d(s):
+    s = s.replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    return base64.b64decode(s)
+
+
+def _brace(raw):
+    depth = 0
+    for i, ch in enumerate(raw):
+        if ch == 0x7B:
+            depth += 1
+        elif ch == 0x7D:
+            depth -= 1
+            if depth == 0:
+                return raw[: i + 1]
+    return None
+
+
+def decode_state(state):
+    """Walk the nested base64/JWT chain until a dict with device_fingerprint."""
+    def dec(s):
+        if s.count(".") == 2:
+            return json.loads(b64d(s.split(".")[1]))
+        raw = _brace(b64d(s))
+        return json.loads(raw) if raw else None
+
+    def hunt(s, depth=0):
+        if depth > 4 or not isinstance(s, str) or len(s) < 30:
+            return None
+        try:
+            obj = dec(s)
+        except Exception:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        if "device_fingerprint" in obj:
+            return obj
+        for v in obj.values():
+            if isinstance(v, str):
+                found = hunt(v, depth + 1)
+                if found:
+                    return found
+        return None
+
+    return hunt(state)
+
+
+def query(pdir, sql, args=()):
+    """Read a profile's SQLite read-only, via a temp copy (Firefox may hold it)."""
+    src = pdir / "places.sqlite"
+    if not src.exists():
+        return []
+    tmp = tempfile.mktemp(suffix=".sqlite")
+    try:
+        shutil.copy(src, tmp)
+        con = sqlite3.connect(tmp)
+        return con.execute(sql, args).fetchall()
+    except Exception:
+        return []
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def count_in(pdir, kind, column, pattern):
+    """kind: 'places' (moz_places.url) or 'cookies' (moz_cookies.name)."""
+    if kind == "places":
+        src, table = pdir / "places.sqlite", "moz_places"
+    else:
+        src, table = pdir / "cookies.sqlite", "moz_cookies"
+    if not src.exists():
+        return 0
+    tmp = tempfile.mktemp(suffix=".sqlite")
+    try:
+        shutil.copy(src, tmp)
+        con = sqlite3.connect(tmp)
+        return con.execute(
+            f"select count(*) from {table} where {column} like ?", (pattern,)
+        ).fetchone()[0]
+    except Exception:
+        return 0
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def profile_report(name, verbose=False):
+    pdir = PROFILES / name
+    if not (pdir / "fingerprint.json").is_file():
+        return None
+    rows = query(pdir, "select url, last_visit_date from moz_places "
+                       "where last_visit_date is not null order by last_visit_date")
+    attempts = []
+    for url, ts in rows:
+        if not url:
+            continue
+        m = re.search(r"[?&]state=([^&]+)", url)
+        if not m:
+            continue
+        obj = decode_state(urllib.parse.unquote(m.group(1)))
+        if obj:
+            attempts.append((ts, obj, urllib.parse.urlparse(url).netloc))
+    if not attempts:
+        return None
+    ts, obj, host = attempts[0]
+    denied = count_in(pdir, "places", "url", "%policy_denied%")
+    challenge = count_in(pdir, "places", "url", "%radar-challenge%")
+    token = count_in(pdir, "cookies", "name", "access-token")
+    if token:
+        verdict = "OK (challenge dijawab)"
+    elif denied:
+        verdict = "BLOCKED"
+    else:
+        verdict = "?"
+    return {
+        "name": name,
+        "when": datetime.datetime.fromtimestamp(ts / 1e6).strftime("%m-%d %H:%M"),
+        "fp": obj.get("device_fingerprint", ""),
+        "signals_id": obj.get("signals_id"),
+        "source": obj.get("source"),
+        "host": host,
+        "denied": denied,
+        "challenge": challenge,
+        "token": token,
+        "verdict": verdict,
+        "raw": obj if verbose else None,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("profiles", nargs="*")
+    ap.add_argument("--verbose", "-v", action="store_true",
+                    help="print the full JWT payload")
+    ap.add_argument("--group", action="store_true",
+                    help="group profiles by device_fingerprint")
+    a = ap.parse_args()
+
+    if a.profiles:
+        names = a.profiles
+    else:
+        names = sorted(os.path.basename(os.path.dirname(p))
+                       for p in glob.glob(str(PROFILES / "*/fingerprint.json")))
+
+    reports = [r for r in (profile_report(n, a.verbose) for n in names) if r]
+    if not reports:
+        print("no Cline login attempt found in those profiles")
+        return 1
+
+    reports.sort(key=lambda r: r["fp"])
+    print(f"{'profil':9}{'kapan':13}{'device_fingerprint':18}{'src':8}"
+          f"{'denied':7}{'chal':6}{'at':4} hasil")
+    print("-" * 96)
+    for r in reports:
+        print(f"{r['name']:9}{r['when']:13}{r['fp'][:16]:18}{str(r['source']):8}"
+              f"{r['denied']:<7}{r['challenge']:<6}{r['token']:<4} {r['verdict']}")
+
+    if a.group:
+        groups = {}
+        for r in reports:
+            groups.setdefault(r["fp"], []).append(r)
+        print(f"\n{len(groups)} device_fingerprint unik untuk {len(reports)} percobaan:")
+        for fp, rs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+            ok = sum(1 for r in rs if r["token"])
+            print(f"  {fp[:16]}  {len(rs):2}x  sukses={ok} blocked={len(rs)-ok}  "
+                  f"{[r['name'] for r in rs]}")
+
+    if a.verbose and len(reports) == 1:
+        print("\npayload JWT lengkap:")
+        print(json.dumps(reports[0]["raw"], indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
