@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Measure a running Dolphin Anty profile and compare it with the host browser.
+
+Dolphin (SunBrowser) exposes a CDP port while a profile is open -- the
+`--down-port` in its launch command, also recorded in
+`~/.config/dolphin_anty/browser_profiles/<id>/dp`. This attaches to that port,
+runs the same probe set as cfm-leakcheck, and flags the axes where the profile
+agrees with the host's own Chrome.
+
+Open the profile in Dolphin Anty first; there is nothing to measure otherwise.
+
+Usage:
+  cfm-dolphin-check                 # auto-detect the open profile
+  cfm-dolphin-check 888829401       # a specific profile id
+  cfm-dolphin-check --profile-only  # no host comparison, just dump values
+"""
+import argparse
+import glob
+import json
+import os
+import pathlib
+import re
+import socket
+import subprocess
+import sys
+
+DOLPHIN = pathlib.Path.home() / ".config" / "dolphin_anty"
+PROFILE_DIRS = DOLPHIN / "browser_profiles"
+CHROME = "/usr/bin/google-chrome"
+
+# Same classification as cfm-leakcheck: "specific" = a match with the host is a
+# correlation risk; "generic" = matching means nothing (millions of machines do).
+AXES = {
+    "webglRenderer": "specific",
+    "webglVendor": "specific",
+    "cores": "specific",
+    "screen": "specific",
+    "ua": "specific",
+    "canvas": "specific",
+    "timezone": "specific",
+    "fontsHash": "generic",
+    "platform": "generic",
+    "plugins": "generic",
+}
+
+JS = r"""
+() => {
+  const fnv = s => { let h = 0x811c9dc5 >>> 0;
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return h.toString(16).padStart(8, '0'); };
+  const o = {};
+  const c = document.createElement('canvas'); c.width = 280; c.height = 60;
+  const t = c.getContext('2d');
+  t.textBaseline = 'alphabetic'; t.fillStyle = '#f60'; t.fillRect(125, 1, 62, 20);
+  t.fillStyle = '#069'; t.font = '11pt no-real-font-123';
+  t.fillText('Cwm fjordbank glyphs vext quiz', 2, 15);
+  o.canvas = fnv(c.toDataURL());
+
+  const g = document.createElement('canvas'); g.width = 256; g.height = 256;
+  let gl = null;
+  for (const id of ['webgl2', 'webgl', 'experimental-webgl']) { gl = g.getContext(id); if (gl) break; }
+  const e = gl && gl.getExtension('WEBGL_debug_renderer_info');
+  o.webglVendor = gl ? (e ? gl.getParameter(e.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR)) : 'none';
+  o.webglRenderer = gl ? (e ? gl.getParameter(e.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) : 'none';
+  o.glMaxTex = gl ? gl.getParameter(gl.MAX_TEXTURE_SIZE) : null;
+  o.glMaxCombined = gl ? gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS) : null;
+
+  const FONTS = ['Arial','Helvetica','Times New Roman','Courier New','Verdana','Georgia','Tahoma',
+    'Segoe UI','Calibri','Consolas','DejaVu Sans','Liberation Sans','Noto Sans','Ubuntu','Cantarell',
+    'FreeSans','Nimbus Sans','Roboto','Menlo','Monaco'];
+  const span = document.createElement('span');
+  span.style.cssText = 'position:absolute;left:-9999px;font-size:72px;white-space:nowrap';
+  span.textContent = 'mmMwWLli10Oo#@';
+  document.body.appendChild(span);
+  const base = {};
+  for (const fam of ['monospace', 'sans-serif', 'serif']) {
+    span.style.fontFamily = fam; base[fam] = [span.offsetWidth, span.offsetHeight];
+  }
+  const found = [];
+  for (const f of FONTS) for (const fam of ['monospace', 'sans-serif', 'serif']) {
+    span.style.fontFamily = `'${f}', ${fam}`;
+    const b = base[fam];
+    if (span.offsetWidth !== b[0] || span.offsetHeight !== b[1]) { found.push(f); break; }
+  }
+  span.remove();
+  o.fonts = found;
+  o.fontsHash = fnv(found.join(','));
+
+  o.cores = navigator.hardwareConcurrency;
+  o.platform = navigator.platform;
+  o.ua = navigator.userAgent;
+  o.screen = [screen.width, screen.height];
+  o.avail = [screen.availWidth, screen.availHeight];
+  o.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  o.language = navigator.language;
+  o.languages = (navigator.languages || []).join(',');
+  o.plugins = navigator.plugins.length;
+  o.deviceMemory = navigator.deviceMemory === undefined ? null : navigator.deviceMemory;
+  o.maxTouchPoints = navigator.maxTouchPoints;
+  o.webdriver = navigator.webdriver;
+  o.hasWebGPU = !!navigator.gpu;
+  o.pdfViewer = !!navigator.pdfViewerEnabled;
+  o.chromeObj = typeof window.chrome === 'object';
+  o.productSub = navigator.productSub;
+  o.vendor = navigator.vendor;
+  return o;
+}
+"""
+
+
+def port_open(port):
+    with socket.socket() as s:
+        s.settimeout(0.4)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def cdp_version(port):
+    try:
+        out = subprocess.run(["curl", "-s", "-m", "3", f"http://127.0.0.1:{port}/json/version"],
+                             capture_output=True, text=True, timeout=6).stdout
+        j = json.loads(out)
+        return j.get("Browser", "")
+    except Exception:
+        return ""
+
+
+def candidate_ports(profile_id=None):
+    """Ports to try: the recorded down-port first, then anything listening."""
+    ports = []
+    pats = [PROFILE_DIRS / profile_id / "dp"] if profile_id else sorted(PROFILE_DIRS.glob("*/dp"))
+    for p in pats:
+        try:
+            ports.append(int(p.read_text().strip()))
+        except Exception:
+            pass
+    # anything else listening that answers like a browser
+    try:
+        out = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=6).stdout
+        for m in re.finditer(r":(\d{4,5})\s", out):
+            p = int(m.group(1))
+            if p not in ports:
+                ports.append(p)
+    except Exception:
+        pass
+    return ports
+
+
+def find_browser(profile_id=None):
+    """Return (port, browser_string). Also reports what was found instead, so a
+    missing profile browser is distinguishable from Dolphin not running at all.
+    """
+    seen = []
+    for p in candidate_ports(profile_id):
+        if not port_open(p):
+            continue
+        try:
+            out = subprocess.run(["curl", "-s", "-m", "2", f"http://127.0.0.1:{p}/json/version"],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            continue
+        if not out:
+            continue
+        if '"Browser"' in out:
+            try:
+                return p, json.loads(out).get("Browser", "")
+            except Exception:
+                return p, ""
+        if "session token" in out:
+            seen.append((p, "dolphin-local-api"))
+        else:
+            seen.append((p, "other-service"))
+    return None, seen
+
+
+def last_launch_activity():
+    """Pull the most recent profile launch/exit from Dolphin's own log, so
+    "nothing to measure" can be explained instead of just reported.
+    """
+    logs = sorted((DOLPHIN / "logs").glob("*.log"), key=lambda p: p.stat().st_mtime)
+    if not logs:
+        return None
+    try:
+        tail = logs[-1].read_text(errors="replace")[-400000:]
+    except Exception:
+        return None
+    launch = None
+    exit_ = None
+    for line in tail.split("\n"):
+        ts = line[:19]
+        if "\u0417\u0430\u043f\u0443\u0441\u043a \u0431\u0440\u0430\u0443\u0437\u0435\u0440\u0430 Anty | \u0412\u0432\u043e\u0434\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435" in line:
+            launch = ts
+        m = re.search(r"browserStateProcessExit \| browser exit (\S+)", line)
+        if m:
+            exit_ = (ts, m.group(1))
+    return launch, exit_
+
+
+def measure_via_cdp(port):
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as pw:
+        browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        ctxs = browser.contexts
+        if not ctxs:
+            return {"error": "no browser context"}
+        ctx = ctxs[0]
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto("https://example.com/", wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(2000)
+        return page.evaluate(JS)
+
+
+def measure_host_chrome(headless=False):
+    from playwright.sync_api import sync_playwright
+    if not pathlib.Path(CHROME).exists():
+        return {"error": f"{CHROME} not found"}
+    if not headless and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        headless = True
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir="/tmp/cfm-dolphin-check-chrome", executable_path=CHROME,
+            headless=headless, args=["--no-first-run", "--no-default-browser-check"],
+            viewport={"width": 1280, "height": 900})
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto("https://example.com/", wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(1500)
+        r = page.evaluate(JS)
+        ctx.close()
+    r["headless"] = headless
+    return r
+
+
+def fmt(v):
+    if isinstance(v, list):
+        return f"{len(v)}x " + ",".join(str(x) for x in v[:3])
+    return str(v)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("profile_id", nargs="?", help="Dolphin profile id (default: auto-detect)")
+    ap.add_argument("--profile-only", action="store_true", help="skip the host comparison")
+    a = ap.parse_args()
+
+    port, info = find_browser(a.profile_id)
+    if not port:
+        print("No open Dolphin profile found.", file=sys.stderr)
+        if info:
+            print(f"  Ports that answered: {info}", file=sys.stderr)
+            if any(k == "dolphin-local-api" for _, k in info):
+                print("  Dolphin Anty itself is running, but no profile browser is open.",
+                      file=sys.stderr)
+        act = last_launch_activity()
+        if act:
+            launch, exit_ = act
+            if launch:
+                print(f"  Last profile launch in Dolphin's log: {launch} UTC", file=sys.stderr)
+            if exit_:
+                print(f"  Last browser exit: {exit_[0]} UTC (exit code {exit_[1]})", file=sys.stderr)
+        print("\nOpen the profile in Dolphin Anty and leave the browser window open -- the CDP\n"
+              "port only exists while it runs.", file=sys.stderr)
+        return 1
+    print(f"attached to Dolphin profile on CDP port {port} ({info})\n")
+
+    prof = measure_via_cdp(port)
+    if "error" in prof:
+        print(json.dumps(prof, indent=1))
+        return 1
+
+    if a.profile_only:
+        print(json.dumps(prof, indent=1))
+        return 0
+
+    host = measure_host_chrome()
+    if "error" in host:
+        print(f"host measurement failed: {host['error']}", file=sys.stderr)
+        print(json.dumps(prof, indent=1))
+        return 1
+
+    print(f"  {'axis':16}{'HOST (chrome)':34}{'DOLPHIN':34}verdict")
+    print("  " + "-" * 96)
+    leaks = []
+    for axis, kind in AXES.items():
+        h, p = host.get(axis), prof.get(axis)
+        same = h == p
+        if same and kind == "specific":
+            verdict = "LEAK"; leaks.append(axis)
+        elif same:
+            verdict = "ok (generic)"
+        else:
+            verdict = "ok (spoofed)"
+        print(f"  {axis:16}{fmt(h)[:33]:34}{fmt(p)[:33]:34}{verdict}")
+
+    print("\n  axis yang tidak dibandingkan dengan host:")
+    for k in ("avail", "language", "languages", "deviceMemory", "maxTouchPoints",
+              "webdriver", "hasWebGPU", "pdfViewer", "chromeObj", "productSub", "vendor",
+              "glMaxTex", "glMaxCombined"):
+        print(f"    {k:16}{fmt(prof.get(k))}")
+
+    print()
+    if host.get("headless"):
+        print("  catatan: Chrome host dijalankan headless -> webglRenderer-nya SwiftShader.")
+    if leaks:
+        print(f"  {len(leaks)} axis bocor ke host: {', '.join(leaks)}")
+    else:
+        print("  tidak ada axis spesifik yang bocor ke host")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
