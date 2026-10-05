@@ -555,6 +555,23 @@ def main():
                      f"{type(e).__name__}: {msg[:160]}")
         print(f"    exit IP : {kw['geoip']}")
 
+        # AF-010: Camoufox computes the right timezone from geoip and writes it
+        # to a pref, but the page still reports the HOST timezone -- verified
+        # with an explicit config={'timezone': ...} and with a SG proxy, both
+        # of which still returned the host's zone. Playwright's own
+        # timezone_id DOES work, so set it here from the same geoip lookup.
+        # Without this a Singapore proxy next to an Asia/Jakarta clock is a
+        # plain VPN tell, and every profile shares the host's zone.
+        try:
+            from camoufox.geolocation import get_geolocation
+            tz = get_geolocation(kw["geoip"]).timezone
+            if tz:
+                kw["timezone_id"] = tz
+                print(f"    timezone: {tz}")
+        except Exception as exc:
+            print(f"[!] timezone not set ({exc.__class__.__name__}); page will "
+                  f"report the host timezone (AF-010)")
+
     n_fonts = with_desktop_fonts(kw, os_name)
     if n_fonts:
         print(f"    fonts   : +{n_fonts} desktop names (cfm-fonts)")

@@ -127,7 +127,7 @@ def measure_chrome(headless=False):
     return r
 
 
-def measure_profile(name, use_cfox_fonts=True, noise=True):
+def measure_profile(name, use_cfox_fonts=True, noise=True, use_proxy=True):
     sys.path.insert(0, str(pathlib.Path.home() / ".local" / "bin"))
     try:
         import cfm_gpu
@@ -141,6 +141,23 @@ def measure_profile(name, use_cfox_fonts=True, noise=True):
               os=meta["os"], fingerprint_preset=meta["preset"], humanize=True,
               locale="en-US", headless=True, main_world_eval=True, no_viewport=True,
               i_know_what_im_doing=True)
+    # Mirror what cfox does with the stored proxy: resolve the exit IP and set
+    # Playwright's timezone_id from it. Camoufox's own timezone handling does
+    # not reach the page (AF-010), so without this the measurement would report
+    # the host timezone even though cfox fixes it.
+    if use_proxy and meta.get("proxy_port") and meta["proxy_port"] != "__none__":
+        try:
+            from camoufox.ip import public_ip
+            from camoufox.geolocation import get_geolocation
+            server = f"socks5://127.0.0.1:{meta['proxy_port']}"
+            kw["proxy"] = {"server": server}
+            ip = public_ip(server)
+            kw["geoip"] = ip
+            tz = get_geolocation(ip).timezone
+            if tz:
+                kw["timezone_id"] = tz
+        except Exception:
+            pass
     if use_cfox_fonts:
         try:
             from importlib.machinery import SourceFileLoader
@@ -172,9 +189,12 @@ def main():
     ap.add_argument("profile")
     ap.add_argument("--no-chrome", action="store_true", help="skip the host measurement")
     ap.add_argument("--no-fonts", action="store_true", help="do not apply cfox's font set")
+    ap.add_argument("--no-proxy", action="store_true",
+                    help="ignore the stored proxy (and its timezone) for this profile")
     a = ap.parse_args()
 
-    prof = measure_profile(a.profile, use_cfox_fonts=not a.no_fonts)
+    prof = measure_profile(a.profile, use_cfox_fonts=not a.no_fonts,
+                           use_proxy=not a.no_proxy)
     if a.no_chrome:
         print(json.dumps(prof, indent=1))
         return 0
