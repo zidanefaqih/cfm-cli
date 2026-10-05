@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Compare a cfm profile against the real host browser, axis by axis.
+
+Answers the recurring question: "does my profile leak my machine?"
+
+It measures the same set of signals twice -- once with the host's own Chrome
+and once inside a cfm/Camoufox profile -- and prints LEAK where the two match,
+because a match on a non-generic axis is what lets a site tie the profile back
+to the machine.
+
+Axis classification:
+  LEAK   the values match and they are specific to this machine (timezone,
+         fonts, canvas when unspoofed). Matching here is a correlation risk.
+  ok     the profile reports something else (spoofed), or the value is
+         generic (platform string, plugin count) and matches millions of
+         real machines, so matching means nothing.
+
+Note on canvas: Camoufox randomises it per launch, so it will differ from the
+host but also differ between runs -- it is not a stable per-profile identity.
+
+Usage:
+  cfm-leakcheck <profile>              # host Chrome vs this profile
+  cfm-leakcheck <profile> --no-chrome  # profile only, print its values
+"""
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+PROFILES = pathlib.Path.home() / "camfox-profiles"
+CHROME = "/usr/bin/google-chrome"
+
+# axis -> "specific" (a match is a leak) or "generic" (a match means nothing)
+#
+# fontsHash is generic on purpose: the set is the standard Linux desktop set
+# (DejaVu, Liberation, Noto Sans, Ubuntu, ...) that every Ubuntu/Fedora box
+# shows, so matching the host does not identify the machine. What mattered was
+# that it used to be EMPTY (0 fonts), which reads as a stripped browser -- see
+# AF-005. Matching a common set is the goal, not a leak.
+AXES = {
+    "webglRenderer": "specific",
+    "webglVendor": "specific",
+    "cores": "specific",
+    "screen": "specific",
+    "ua": "specific",
+    "canvas": "specific",
+    "timezone": "specific",
+    "fontsHash": "generic",
+    "platform": "generic",
+    "plugins": "generic",
+}
+
+JS = r"""
+() => {
+  const fnv = s => { let h = 0x811c9dc5 >>> 0;
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return h.toString(16).padStart(8, '0'); };
+  const o = {};
+  const c = document.createElement('canvas'); c.width = 280; c.height = 60;
+  const t = c.getContext('2d');
+  t.textBaseline = 'alphabetic'; t.fillStyle = '#f60'; t.fillRect(125, 1, 62, 20);
+  t.fillStyle = '#069'; t.font = '11pt no-real-font-123';
+  t.fillText('Cwm fjordbank glyphs vext quiz', 2, 15);
+  o.canvas = fnv(c.toDataURL());
+
+  const g = document.createElement('canvas'); g.width = 256; g.height = 256;
+  let gl = null;
+  for (const id of ['webgl2', 'webgl', 'experimental-webgl']) { gl = g.getContext(id); if (gl) break; }
+  const e = gl && gl.getExtension('WEBGL_debug_renderer_info');
+  o.webglVendor = gl ? (e ? gl.getParameter(e.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR)) : 'none';
+  o.webglRenderer = gl ? (e ? gl.getParameter(e.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) : 'none';
+
+  const FONTS = ['Arial','Helvetica','Times New Roman','Courier New','Verdana','Georgia','Tahoma',
+    'Segoe UI','Calibri','Consolas','DejaVu Sans','Liberation Sans','Noto Sans','Ubuntu','Cantarell',
+    'FreeSans','Nimbus Sans','Roboto','Menlo','Monaco'];
+  const span = document.createElement('span');
+  span.style.cssText = 'position:absolute;left:-9999px;font-size:72px;white-space:nowrap';
+  span.textContent = 'mmMwWLli10Oo#@';
+  document.body.appendChild(span);
+  const base = {};
+  for (const fam of ['monospace', 'sans-serif', 'serif']) {
+    span.style.fontFamily = fam; base[fam] = [span.offsetWidth, span.offsetHeight];
+  }
+  const found = [];
+  for (const f of FONTS) for (const fam of ['monospace', 'sans-serif', 'serif']) {
+    span.style.fontFamily = `'${f}', ${fam}`;
+    const b = base[fam];
+    if (span.offsetWidth !== b[0] || span.offsetHeight !== b[1]) { found.push(f); break; }
+  }
+  span.remove();
+  o.fonts = found;
+  o.fontsHash = fnv(found.join(','));
+
+  o.cores = navigator.hardwareConcurrency;
+  o.platform = navigator.platform;
+  o.ua = navigator.userAgent;
+  o.screen = [screen.width, screen.height];
+  o.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  o.plugins = navigator.plugins.length;
+  return o;
+}
+"""
+
+
+def measure_chrome(headless=False):
+    """Headful by default: headless Chrome falls back to SwiftShader and reports a
+    software renderer, which is not the GPU a site would see from this machine.
+    """
+    from playwright.sync_api import sync_playwright
+    if not pathlib.Path(CHROME).exists():
+        return {"error": f"{CHROME} not found"}
+    if not headless and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        headless = True  # no display available; the GPU reading will be SwiftShader
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir="/tmp/cfm-leakcheck-chrome", executable_path=CHROME,
+            headless=headless, args=["--no-first-run", "--no-default-browser-check"],
+            viewport={"width": 1280, "height": 900})
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto("https://example.com/", wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(1500)
+        r = page.evaluate(JS)
+        ctx.close()
+    r["headless"] = headless
+    return r
+
+
+def measure_profile(name, use_cfox_fonts=True, noise=True):
+    sys.path.insert(0, str(pathlib.Path.home() / ".local" / "bin"))
+    try:
+        import cfm_gpu
+        cfm_gpu.install_sample_webgl_patch()
+    except Exception:
+        pass
+    from camoufox.sync_api import Camoufox
+    pdir = PROFILES / name
+    meta = json.loads((pdir / "fingerprint.json").read_text())
+    kw = dict(persistent_context=True, user_data_dir=str(pdir), window=(900, 600),
+              os=meta["os"], fingerprint_preset=meta["preset"], humanize=True,
+              locale="en-US", headless=True, main_world_eval=True, no_viewport=True,
+              i_know_what_im_doing=True)
+    if use_cfox_fonts:
+        try:
+            from importlib.machinery import SourceFileLoader
+            cfox = SourceFileLoader("cfox_mod", str(pathlib.Path.home() / ".local" / "bin" / "cfox")).load_module()
+            cfox.with_desktop_fonts(kw, meta["os"])
+        except Exception:
+            pass
+    with Camoufox(**kw) as ctx:
+        if noise:
+            try:
+                import cfm_readpixels
+                cfm_readpixels.install(ctx, cfm_readpixels.ensure_seed(pdir))
+            except Exception:
+                pass
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto("https://example.com/", wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(1500)
+        return page.evaluate(JS)
+
+
+def fmt(v):
+    if isinstance(v, list):
+        return f"{len(v)}x " + ",".join(str(x) for x in v[:3])
+    return str(v)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("profile")
+    ap.add_argument("--no-chrome", action="store_true", help="skip the host measurement")
+    ap.add_argument("--no-fonts", action="store_true", help="do not apply cfox's font set")
+    a = ap.parse_args()
+
+    prof = measure_profile(a.profile, use_cfox_fonts=not a.no_fonts)
+    if a.no_chrome:
+        print(json.dumps(prof, indent=1))
+        return 0
+    host = measure_chrome()
+    if "error" in host:
+        print(f"host measurement failed: {host['error']}", file=sys.stderr)
+        print(json.dumps(prof, indent=1))
+        return 1
+
+    print(f"\n  {'axis':16}{'HOST (chrome)':34}{'PROFILE ' + a.profile:34}verdict")
+    print("  " + "-" * 96)
+    leaks = []
+    for axis, kind in AXES.items():
+        h, p = host.get(axis), prof.get(axis)
+        same = h == p
+        if same and kind == "specific":
+            verdict = "LEAK"
+            leaks.append(axis)
+        elif same:
+            verdict = "ok (generic)"
+        else:
+            verdict = "ok (spoofed)"
+        print(f"  {axis:16}{fmt(h)[:33]:34}{fmt(p)[:33]:34}{verdict}")
+
+    print()
+    if host.get("headless"):
+        print("  catatan: Chrome dijalankan headless (tidak ada display) -> webglRenderer-nya")
+        print("           SwiftShader, bukan GPU asli. Jalankan dari sesi desktop untuk bacaan benar.")
+    if leaks:
+        print(f"  {len(leaks)} axis bocor ke host: {', '.join(leaks)}")
+    else:
+        print("  tidak ada axis spesifik yang bocor")
+    print("  catatan: 'canvas' diacak per launch oleh Camoufox, jadi beda dari host DAN beda")
+    print("           antar-run — bukan identitas profil yang stabil.")
+    print("  catatan: 'fontsHash' cocok dengan host, tapi itu set desktop Linux standar yang")
+    print("           sama di semua Ubuntu/Fedora — bukan penanda mesin ini (dulu malah 0 font,")
+    print("           yang justru menandai browser di-strip; lihat AF-005).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
