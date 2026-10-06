@@ -196,17 +196,71 @@ def last_launch_activity():
 
 
 def measure_via_cdp(port):
+    """Measure through a throwaway browser context.
+
+    The user's own tabs are left alone: navigating one of them to example.com
+    would destroy a logged-in session. A fresh context (incognito-like) has the
+    same fingerprint because it is the same browser process.
+    """
     from playwright.sync_api import sync_playwright
-    with sync_playwright() as pw:
+    pw = sync_playwright().start()
+    try:
         browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
-        ctxs = browser.contexts
-        if not ctxs:
-            return {"error": "no browser context"}
-        ctx = ctxs[0]
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.goto("https://example.com/", wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(2000)
-        return page.evaluate(JS)
+        ctx = browser.new_context()
+        try:
+            page = ctx.new_page()
+            page.goto("https://example.com/", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
+            return page.evaluate(JS)
+        finally:
+            ctx.close()
+    finally:
+        # Disconnect only. Never close the browser the user is working in.
+        pw.stop()
+
+
+def profile_for_port(port):
+    """Map a down-port back to (profile id, profile name)."""
+    pid = None
+    for p in PROFILE_DIRS.glob("*/dp"):
+        try:
+            if int(p.read_text().strip()) == port:
+                pid = p.parent.name
+                break
+        except Exception:
+            continue
+    if not pid:
+        return None, None
+    name = None
+    logs = sorted((DOLPHIN / "logs").glob("*.log"), key=lambda p: p.stat().st_mtime)
+    if logs:
+        try:
+            tail = logs[-1].read_text(errors="replace")[-2000000:]
+            m = re.search(rf"browser_profile_id:{pid},profile_name:'([^']+)'", tail)
+            if m:
+                name = m.group(1)
+        except Exception:
+            pass
+    return pid, name
+
+
+def wait_for_browser(seconds, profile_id=None):
+    """Poll until a profile browser exposes CDP. Fixes the race where the user
+    opens a profile and it is already closed by the time the check runs.
+    """
+    import time
+    deadline = time.time() + seconds
+    last = 0
+    while time.time() < deadline:
+        port, info = find_browser(profile_id)
+        if port:
+            return port, info
+        if time.time() - last >= 5:
+            last = time.time()
+            print(f"  ...waiting for a profile browser ({int(deadline - time.time())}s left)",
+                  file=sys.stderr)
+        time.sleep(1)
+    return None, None
 
 
 def measure_host_chrome(headless=False):
@@ -239,9 +293,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("profile_id", nargs="?", help="Dolphin profile id (default: auto-detect)")
     ap.add_argument("--profile-only", action="store_true", help="skip the host comparison")
+    ap.add_argument("--wait", type=int, default=0, metavar="SECONDS",
+                    help="poll for a profile browser to appear, then measure it")
     a = ap.parse_args()
 
-    port, info = find_browser(a.profile_id)
+    if a.wait:
+        print(f"waiting up to {a.wait}s for a Dolphin profile browser...", file=sys.stderr)
+        port, info = wait_for_browser(a.wait, a.profile_id)
+    else:
+        port, info = find_browser(a.profile_id)
     if not port:
         print("No open Dolphin profile found.", file=sys.stderr)
         if info:
@@ -256,10 +316,12 @@ def main():
                 print(f"  Last profile launch in Dolphin's log: {launch} UTC", file=sys.stderr)
             if exit_:
                 print(f"  Last browser exit: {exit_[0]} UTC (exit code {exit_[1]})", file=sys.stderr)
-        print("\nOpen the profile in Dolphin Anty and leave the browser window open -- the CDP\n"
-              "port only exists while it runs.", file=sys.stderr)
+        print("\nOpen the profile in Dolphin Anty and LEAVE THE WINDOW OPEN -- the CDP\n"
+              "port only exists while it runs. Or run with --wait 120 to catch it.", file=sys.stderr)
         return 1
-    print(f"attached to Dolphin profile on CDP port {port} ({info})\n")
+    pid, name = profile_for_port(port)
+    who = f"{name} ({pid})" if name else (pid or "unknown profile")
+    print(f"attached to Dolphin profile {who} on CDP port {port} ({info})\n")
 
     prof = measure_via_cdp(port)
     if "error" in prof:
